@@ -175,29 +175,35 @@ class GGUFFile {
         print("GGUF file loaded successfully. Header Version: \(self.header.version), Tensors: \(self.header.tensorCount)")
 
         // 6. (Optional) Validate total data size matches calculated size (like llama.cpp does)
-        var calculatedDataSize: UInt64 = 0
-        for tensor in self.tensors {
-            let tensorSize = tensor.byteSize // Uses the existing correct calculation
-            let paddedTensorSize = (tensorSize + self.alignment - 1) & ~(self.alignment - 1) // Pad size to alignment
+        var calculatedDataSizeStrict: UInt64 = 0 // Tracks strictly calculated offset
+        var calculatedDataSizeWarn: UInt64 = 0 // Used for warnings, resets on mismatch
 
-            // Check if the tensor's relative offset matches the accumulated size
-            if tensor.offset != calculatedDataSize {
-                print("--- WARNING: Tensor '\(tensor.name)' has relative offset \(tensor.offset), but expected offset \(calculatedDataSize) based on previous tensors.")
-                // Decide how to handle: maybe just warn, or throw error? llama.cpp errors here.
-                // For now, let's just update calculatedDataSize to match tensor.offset to continue validation
-                calculatedDataSize = tensor.offset
+        for tensor in self.tensors {
+            let tensorSize = tensor.byteSize
+            let paddedTensorSize = (tensorSize + self.alignment - 1) & ~(self.alignment - 1)
+
+            // Check against the warning tracker
+            if tensor.offset != calculatedDataSizeWarn {
+                print("--- WARNING: Tensor '\(tensor.name)' has relative offset \(tensor.offset), but expected offset \(calculatedDataSizeWarn) based on previous tensors (warning calc).")
+                calculatedDataSizeWarn = tensor.offset // Reset warning tracker to file's offset
             }
-            calculatedDataSize += paddedTensorSize // Accumulate the *padded* size for the next expected offset
+            calculatedDataSizeWarn += paddedTensorSize // Advance warning tracker by padded size
+
+            // Check against the strict tracker (no reset)
+            if tensor.offset != calculatedDataSizeStrict {
+                 print("--- INFO: Tensor '\(tensor.name)' relative offset \(tensor.offset) differs from strictly calculated offset \(calculatedDataSizeStrict).")
+            }
+            calculatedDataSizeStrict += paddedTensorSize // Advance strict tracker by padded size
         }
         let endOfFileOffset = UInt64(self.data.count)
-        let expectedEndOfData = self.dataSectionStartOffset + calculatedDataSize
-        print("--- Debug: Calculated total tensor data size (padded): \(calculatedDataSize)")
-        print("--- Debug: Expected end of data offset: \(expectedEndOfData)")
+        let expectedEndOfDataStrict = self.dataSectionStartOffset + calculatedDataSizeStrict
+        print("--- Debug: Calculated total tensor data size (padded, strict): \(calculatedDataSizeStrict)")
+        print("--- Debug: Expected end of data offset (strict): \(expectedEndOfDataStrict)")
         print("--- Debug: Actual end of file offset: \(endOfFileOffset)")
-        if expectedEndOfData > endOfFileOffset {
-            print("--- WARNING: Calculated end of tensor data (\(expectedEndOfData)) exceeds file size (\(endOfFileOffset)). File might be truncated or calculation error.")
-        } else if expectedEndOfData < endOfFileOffset {
-            print("--- Debug: File contains \(endOfFileOffset - expectedEndOfData) extra bytes after calculated tensor data.")
+        if expectedEndOfDataStrict > endOfFileOffset {
+            print("--- WARNING: Calculated end of tensor data (\(expectedEndOfDataStrict)) exceeds file size (\(endOfFileOffset)). File might be truncated or calculation error.")
+        } else if expectedEndOfDataStrict < endOfFileOffset {
+            print("--- Debug: File contains \(endOfFileOffset - expectedEndOfDataStrict) extra bytes after calculated tensor data.")
         }
     }
 
@@ -226,6 +232,30 @@ class GGUFFile {
         }
 
         let endOffset = absoluteOffset + byteSize
+
+        // *** ADD SPECIFIC LOGGING FOR rope_freqs.weight ***
+        if tensor.name == "rope_freqs.weight" {
+            print("--- Debug [getTensorData for rope_freqs.weight]:")
+            print("    Relative Offset: \(tensor.offset)")
+            print("    Byte Size: \(byteSize)")
+            print("    Data Section Start: \(self.dataSectionStartOffset)")
+            print("    Calculated Absolute Offset: \(absoluteOffset)")
+            print("    Calculated End Offset: \(endOffset)")
+            print("    File Size: \(data.count)")
+
+            // Peek at the bytes where the data should start
+            if absoluteOffset >= 0 && absoluteOffset + min(byteSize, 16) <= data.count { // Peek up to 16 bytes
+                 let peekCount = min(byteSize, 16)
+                 let peekRange = absoluteOffset..<(absoluteOffset + peekCount)
+                 let peekedData = data.subdata(in: peekRange)
+                 let hexString = peekedData.map { String(format: "%02X", $0) }.joined(separator: " ")
+                 print("    Bytes Peeked at Absolute Offset \(absoluteOffset): \(hexString)")
+            } else {
+                 print("    Cannot peek bytes: Calculated range [\(absoluteOffset)..<\(endOffset)] is out of bounds or invalid.")
+            }
+        }
+        // *** END SPECIFIC LOGGING ***
+
         guard absoluteOffset >= 0, // Ensure start isn't negative (unlikely with UInt64)
               absoluteOffset >= Int(self.dataSectionStartOffset), // Ensure it's within the data section
               endOffset <= data.count // Ensure reading doesn't go past end of file
