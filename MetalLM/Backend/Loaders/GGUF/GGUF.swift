@@ -134,8 +134,9 @@ class GGUFFile {
             guard FileManager.default.fileExists(atPath: url.path) else {
                 throw GGUFError.fileNotFound
             }
-            // Keep memory mapping for efficiency unless proven problematic
+            // Keep memory mapping unless proven problematic
             self.data = try Data(contentsOf: url, options: .mappedIfSafe)
+            print("--- Info: Loaded GGUF file using memory mapping.")
         } catch {
             throw GGUFError.fileReadError(error)
         }
@@ -144,67 +145,60 @@ class GGUFFile {
 
         // 1. Parse header
         self.header = try reader.readHeader()
-        print(
-            "--- Debug: Read Header -> Version: \(self.header.version), TensorCount: \(self.header.tensorCount), MetaKeyCount (from header): \(self.header.metaKeyCount). Offset now: \(reader.currentOffset)"
-        )
+        // --- Keep concise header log ---
+        print("--- GGUF Header: Version=\(self.header.version), Tensors=\(self.header.tensorCount), KVs=\(self.header.metaKeyCount), OffsetAfterHeader=\(reader.currentOffset)")
 
-        // 2. Parse metadata KV pairs (using the correct count from header)
+        // 2. Parse metadata KV pairs
         let metaKeyCount = header.metaKeyCount
-        print("--- Debug: Reading \(metaKeyCount) metadata key-value pairs...")
         self.metadata = try reader.readMetadata(count: metaKeyCount)
         let offsetAfterMetadata = reader.currentOffset
-        print("--- Debug: Offset after reading metadata: \(offsetAfterMetadata)")
+        print("--- GGUF Checkpoint: Offset after Metadata KVs = \(offsetAfterMetadata)")
 
-        // Get alignment value (needed before reading tensors if default isn't used, but applied later)
+        // Get alignment value
         self.alignment = metadata["general.alignment"]?.uint64 ?? 32 // Default 32 if key missing
+        print("--- GGUF Info: Using alignment = \(self.alignment)")
 
         // 3. Parse tensor info table *sequentially*
-        print("--- Debug: Reading \(header.tensorCount) tensor descriptors starting at offset \(offsetAfterMetadata)...")
-        self.tensors = try reader.readTensorDescriptors(count: header.tensorCount) // Reads all tensor infos
+        self.tensors = try reader.readTensorDescriptors(count: header.tensorCount)
         let offsetAfterTensorInfo = reader.currentOffset
-        print("--- Debug: Offset after reading tensor info table: \(offsetAfterTensorInfo)")
+        print("--- GGUF Checkpoint: Offset after Tensor Info Table = \(offsetAfterTensorInfo)")
+
+        // *** ADD TEMPORARY DEBUG: Print first few tensor names and types ***
+        print("--- Debug: First 15 Tensor Names & Types ---")
+        for i in 0..<min(15, self.tensors.count) {
+            let t = self.tensors[i]
+            print("  [\(i)] Name: \(t.name), Type: \(t.type) (\(t.type.rawValue))")
+        }
+        // *** END TEMPORARY DEBUG ***
 
         // 4. Align the offset *AFTER* the tensor info table to find the start of the data section
-        print("--- Debug: Offset before data section alignment padding (alignment=\(alignment)): \(offsetAfterTensorInfo)")
+        print("--- GGUF Checkpoint: Offset before Data Section Alignment = \(offsetAfterTensorInfo)")
         reader.alignTo(alignment: Int(alignment)) // Apply padding based on current offset
         self.dataSectionStartOffset = UInt64(reader.currentOffset) // Store the aligned offset
-        print("--- Debug: Calculated tensor data section start offset: \(self.dataSectionStartOffset)")
+        print("--- GGUF Info: Calculated Tensor Data Section start offset = \(self.dataSectionStartOffset)")
 
-        // 5. Validate metadata (optional)
+        // 5. Validate metadata (Keep - simple check)
         try validateMetadata()
-        print("GGUF file loaded successfully. Header Version: \(self.header.version), Tensors: \(self.header.tensorCount)")
 
-        // 6. (Optional) Validate total data size matches calculated size (like llama.cpp does)
-        var calculatedDataSizeStrict: UInt64 = 0 // Tracks strictly calculated offset
-        var calculatedDataSizeWarn: UInt64 = 0 // Used for warnings, resets on mismatch
-
-        for tensor in self.tensors {
-            let tensorSize = tensor.byteSize
-            let paddedTensorSize = (tensorSize + self.alignment - 1) & ~(self.alignment - 1)
-
-            // Check against the warning tracker
-            if tensor.offset != calculatedDataSizeWarn {
-                print("--- WARNING: Tensor '\(tensor.name)' has relative offset \(tensor.offset), but expected offset \(calculatedDataSizeWarn) based on previous tensors (warning calc).")
-                calculatedDataSizeWarn = tensor.offset // Reset warning tracker to file's offset
+        // 7. *** REVISED Final Sanity Check ***
+        if let lastTensor = self.tensors.last {
+            let lastTensorEnd = self.dataSectionStartOffset + lastTensor.offset + lastTensor.byteSize
+            let fileSize = UInt64(self.data.count)
+            print("--- GGUF Info: Last tensor '\(lastTensor.name)' ends at offset \(lastTensorEnd) (relative offset \(lastTensor.offset), size \(lastTensor.byteSize))")
+            print("--- GGUF Info: Total file size = \(fileSize)")
+            if lastTensorEnd > fileSize {
+                // This would be a genuine error
+                print("--- ERROR: Calculated end of last tensor (\(lastTensorEnd)) exceeds file size (\(fileSize)). File is likely truncated or corrupt.")
+                // Consider throwing an error here if strictness is needed
+                // throw GGUFError.dataOutOfBounds(offset: Int(lastTensorEnd), size: 0, total: Int(fileSize))
+            } else if lastTensorEnd < fileSize {
+                 print("--- GGUF Info: File contains \(fileSize - lastTensorEnd) bytes after the last tensor's data (padding or extra data).")
             }
-            calculatedDataSizeWarn += paddedTensorSize // Advance warning tracker by padded size
+        } else if header.tensorCount > 0 {
+             print("--- WARNING: No tensors found in array despite header reporting tensor count > 0.")
+        }
 
-            // Check against the strict tracker (no reset)
-            if tensor.offset != calculatedDataSizeStrict {
-                 print("--- INFO: Tensor '\(tensor.name)' relative offset \(tensor.offset) differs from strictly calculated offset \(calculatedDataSizeStrict).")
-            }
-            calculatedDataSizeStrict += paddedTensorSize // Advance strict tracker by padded size
-        }
-        let endOfFileOffset = UInt64(self.data.count)
-        let expectedEndOfDataStrict = self.dataSectionStartOffset + calculatedDataSizeStrict
-        print("--- Debug: Calculated total tensor data size (padded, strict): \(calculatedDataSizeStrict)")
-        print("--- Debug: Expected end of data offset (strict): \(expectedEndOfDataStrict)")
-        print("--- Debug: Actual end of file offset: \(endOfFileOffset)")
-        if expectedEndOfDataStrict > endOfFileOffset {
-            print("--- WARNING: Calculated end of tensor data (\(expectedEndOfDataStrict)) exceeds file size (\(endOfFileOffset)). File might be truncated or calculation error.")
-        } else if expectedEndOfDataStrict < endOfFileOffset {
-            print("--- Debug: File contains \(endOfFileOffset - expectedEndOfDataStrict) extra bytes after calculated tensor data.")
-        }
+        print("--- GGUF Success: File loaded and parsed successfully.")
     }
 
     // MARK: - Validation
@@ -215,7 +209,7 @@ class GGUFFile {
         // Add more checks as needed...
     }
 
-    // MARK: - Tensor Data Access *** UPDATED ***
+    // MARK: - Tensor Data Access
     func getTensorData(for tensor: GGUFTensorDescriptor) -> Data {
         // Calculate absolute offset using the data section start + tensor's relative offset
         let absoluteOffset = Int(self.dataSectionStartOffset + tensor.offset)
@@ -232,29 +226,6 @@ class GGUFFile {
         }
 
         let endOffset = absoluteOffset + byteSize
-
-        // *** ADD SPECIFIC LOGGING FOR rope_freqs.weight ***
-        if tensor.name == "rope_freqs.weight" {
-            print("--- Debug [getTensorData for rope_freqs.weight]:")
-            print("    Relative Offset: \(tensor.offset)")
-            print("    Byte Size: \(byteSize)")
-            print("    Data Section Start: \(self.dataSectionStartOffset)")
-            print("    Calculated Absolute Offset: \(absoluteOffset)")
-            print("    Calculated End Offset: \(endOffset)")
-            print("    File Size: \(data.count)")
-
-            // Peek at the bytes where the data should start
-            if absoluteOffset >= 0 && absoluteOffset + min(byteSize, 16) <= data.count { // Peek up to 16 bytes
-                 let peekCount = min(byteSize, 16)
-                 let peekRange = absoluteOffset..<(absoluteOffset + peekCount)
-                 let peekedData = data.subdata(in: peekRange)
-                 let hexString = peekedData.map { String(format: "%02X", $0) }.joined(separator: " ")
-                 print("    Bytes Peeked at Absolute Offset \(absoluteOffset): \(hexString)")
-            } else {
-                 print("    Cannot peek bytes: Calculated range [\(absoluteOffset)..<\(endOffset)] is out of bounds or invalid.")
-            }
-        }
-        // *** END SPECIFIC LOGGING ***
 
         guard absoluteOffset >= 0, // Ensure start isn't negative (unlikely with UInt64)
               absoluteOffset >= Int(self.dataSectionStartOffset), // Ensure it's within the data section
@@ -346,14 +317,12 @@ class DataReader {
         // Read length (8 bytes)
         let length: UInt64 = try read()
         guard length < 1_000_000_000 else {
-             print("!!! DataReader.readString Error: Read excessively large string length (\(length)) at offset \(callStartOffset). Possible data corruption or parsing error.")
              throw GGUFError.invalidSize(Int(clamping: length), expected: 1_000_000_000)
         }
         let intLength = Int(length)
 
         // Read string data (intLength bytes)
         guard offset + intLength <= data.count else {
-            print("!!! DataReader.readString OutOfBounds Error: Trying to read \(intLength) string bytes at offset \(offset) but data count is \(data.count). Length read at offset \(callStartOffset) was \(length).")
             throw GGUFError.dataOutOfBounds(offset: offset, size: intLength, total: data.count)
         }
         let stringData = try self.readBytes(count: intLength) // Reads bytes and advances offset
@@ -361,7 +330,6 @@ class DataReader {
 
         // Decode
         guard let string = String(data: stringData, encoding: .utf8) else {
-             print("!!! DataReader.readString Error: Failed to decode UTF8 string at offset \(offset - intLength) (length \(intLength)).")
             throw GGUFError.invalidString(offset - intLength)
         }
 
@@ -370,8 +338,6 @@ class DataReader {
         let actualAdvance = finalOffset - callStartOffset
         if actualAdvance != expectedAdvance {
              print("!!!!!! CRITICAL readString Offset Mismatch! At start offset \(callStartOffset), expected advance \(expectedAdvance), got \(actualAdvance). String length was \(length).")
-             // Consider throwing an error here to stop immediately
-             // throw GGUFError.invalidOffset(finalOffset)
         }
         // --- End Critical Check ---
 
@@ -412,7 +378,6 @@ class DataReader {
 
     // MARK: - Structure Parsing
 
-    // Updated readHeader with more debugging
     func readHeader() throws -> GGUFHeader {
         let expectedHeaderSize = 4 + 4 + 8 + 8
         guard offset + expectedHeaderSize <= data.count else {
@@ -440,16 +405,6 @@ class DataReader {
         // Offset is now 16
 
         // 4. Read Metadata Key Count (8 bytes)
-        let metaKeyCountOffset = offset
-        // --- BEGIN DEBUG BLOCK FOR METAKEYCOUNT ---
-        let metaKeyCountBytes = data.subdata(in: metaKeyCountOffset..<(metaKeyCountOffset + 8))
-        let metaKeyCountRead: UInt64 = metaKeyCountBytes.withUnsafeBytes {
-            $0.load(as: UInt64.self)
-        }
-        print(
-            "--- Debug: Reading MetaKeyCount at offset \(metaKeyCountOffset). Bytes: \(metaKeyCountBytes.map { String(format: "%02X", $0) }.joined(separator: " ")). Value read: \(metaKeyCountRead)"
-        )
-        // --- END DEBUG BLOCK ---
         let metaKeyCount: UInt64 = try read()  // Actual read that advances offset
         // Offset is now 24
 
@@ -468,119 +423,71 @@ class DataReader {
             print("Warning: Metadata count \(count) seems excessively large.")
             return [:]
         }
-        print("--- Debug: Reading \(count) metadata key-value pairs...")
+
         for i in 0..<count {
-            let keyReadOffset = offset
-
-            // *** MODIFICATION 4: Add Peek Debug for item #36 (index 35) ***
-            if i == 35 {  // Check right before attempting to read the 36th item's key
-                print(
-                    "--- Debug [Meta \(i+1)/\(count)]: PEEKING before reading key at offset \(keyReadOffset)"
-                )
-                do {
-                    let peekBytes = try self.peekBytes(count: 16)
-                    let hexString = peekBytes.map { String(format: "%02X", $0) }.joined(
-                        separator: " ")
-                    print(
-                        "--- Debug [Meta \(i+1)/\(count)]: Bytes peeked at \(keyReadOffset): \(hexString)"
-                    )
-                } catch {
-                    print("--- Debug [Meta \(i+1)/\(count)]: Failed to peek bytes: \(error)")
-                }
-            }
-
             let key = try readString()
-
-            // Decide if we still need per-item logs (maybe just for last few?)
-            let printDebug = (i >= count - 5) // Only log last 5 items
-
-            if printDebug {
-                print("--- Debug [Meta \(i+1)/\(count)]: Reading Key '\(key)' (len=\(key.utf8.count)). Offset now: \(offset)")
-            }
-
             let valueType: UInt32 = try read()
-            if printDebug {
-                print("--- Debug [Meta \(i+1)/\(count)]: Reading Value Type \(valueType) for key '\(key)'. Offset now: \(offset)")
-            }
 
-            // Pass printDebug flag down so readValue can decide whether to log array details
+            // Only pass printDebug=true if you want detail on last few items or specific keys
+            let printDebug = (i >= count - 5) // Debug last 5 KVs
             let value = try readValue(type: valueType, keyHint: key, printDebug: printDebug)
-
-            if printDebug {
-                var valueDesc = ""
-                switch value {
-                case .string(let s): valueDesc = "String(len:\(s.utf8.count))"
-                case .array(let a): valueDesc = "Array(len:\(a.count))" // Array log now happens inside readValue
-                default: valueDesc = "\(value)"
-                }
-                // Don't print array desc here if logged inside readValue
-                if case .array(_) = value {} else {
-                    print("--- Debug [Meta \(i+1)/\(count)]: Read Value (\(valueDesc)) for key '\(key)'. Offset AFTER value read: \(offset)")
-                }
-            }
             metadata[key] = value
         }
-        print("--- Debug: Finished reading metadata.")
+
         return metadata
     }
 
+    // Inside DataReader.swift -> readTensorDescriptors
     func readTensorDescriptors(count: UInt64) throws -> [GGUFTensorDescriptor] {
         var tensors: [GGUFTensorDescriptor] = []
-        guard count <= 1_000_000 else {
-            print("Warning: Tensor count \(count) seems excessively large.")
-            return []
-        }
+        guard count <= 1_000_000 else { /* ... */ return [] }
         print("--- Debug: Reading \(count) tensor descriptors...")
         for i in 0..<count {
-            print("--- Debug: Reading tensor descriptor #\(i+1)")
+            let name = try readString()
 
-            // --- Direct Read Attempt for First Tensor Name Length ---
-            let nameLengthOffset = offset
-            print("------ Debug: Attempting to read UInt64 tensor name length at offset \(nameLengthOffset)")
-            var nameLengthBytesString = "N/A"
-            do {
-                let peekedBytes = try self.peekBytes(count: 8)
-                nameLengthBytesString = peekedBytes.map { String(format: "%02X", $0) }.joined(separator: " ")
-                print("------ Debug: Bytes peeked for length at \(nameLengthOffset): \(nameLengthBytesString)")
+            let nDims: UInt32 = try read()
 
-                // Directly call read<UInt64>()
-                let nameLength: UInt64 = try self.read() // Uses the generic read<T>
-                print("------ Debug: Successfully read nameLength = \(nameLength) using read<T>(). Offset now: \(offset)")
-
-                // Now read the actual string bytes using the length
-                guard nameLength < 1000 else { // Smaller limit for tensor names
-                     throw GGUFError.invalidSize(Int(clamping: nameLength), expected: 1000)
-                }
-                let intNameLength = Int(nameLength)
-                let nameData = try self.readBytes(count: intNameLength)
-                guard let name = String(data: nameData, encoding: .utf8) else {
-                     throw GGUFError.invalidString(offset - intNameLength)
-                }
-                 print("------ Debug: Successfully read tensor name = '\(name)'")
-
-                 // --- Continue reading the rest of the descriptor ---
-                 let nDims: UInt32 = try read()
-                 var dims: [UInt64] = []
-                 guard nDims <= 16 else { throw GGUFError.invalidSize(Int(nDims), expected: 16) }
-                 for _ in 0..<nDims { dims.append(try read()) }
-                 let typeRaw: UInt32 = try read()
-                 guard let type = GGUFDataType(rawValue: typeRaw) else { throw GGUFError.unsupportedType(typeRaw) }
-                 let dataOffset: UInt64 = try read()
-                 tensors.append( GGUFTensorDescriptor(name: name, dims: dims, type: type, offset: dataOffset) )
-
-
-            } catch {
-                 print("!!!!!! ERROR during direct read/processing of tensor #\(i+1) name/descriptor at offset \(nameLengthOffset): \(error)")
-                 print("!!!!!! Bytes peeked for length were: \(nameLengthBytesString)")
-                 throw error // Re-throw the error
+            var dims: [UInt64] = []
+            guard nDims <= 16 else { throw GGUFError.invalidSize(Int(nDims), expected: 16) }
+            for _ in 0..<nDims {
+                dims.append(try read())
             }
-            // --- End Direct Read Attempt ---
 
-            // Original code (commented out for now):
-            // let name = try readString()
-            // let nDims: UInt32 = try read()
-            // ... rest ...
-            // tensors.append(...)
+            // *** FOCUSED DEBUG FOR TYPE READ ***
+            let typeReadOffset = offset
+            var typeBytesString = "N/A"
+            do {
+                let peekedBytes = try self.peekBytes(count: 4) // Peek 4 bytes for UInt32 type
+                typeBytesString = peekedBytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+                print("------ Tensor #\(i+1) '\(name)': PEEKing for type at offset \(typeReadOffset). Bytes: \(typeBytesString)")
+            } catch {
+                print("------ Tensor #\(i+1) '\(name)': FAILED to peek for type at offset \(typeReadOffset): \(error)")
+            }
+
+            let typeRaw: UInt32 = try read() // Read the type
+            print("------ Tensor #\(i+1) '\(name)': READ typeRaw = \(typeRaw) from offset \(typeReadOffset). Offset now \(offset).")
+            // *** END FOCUSED DEBUG ***
+
+            guard let type = GGUFDataType(rawValue: typeRaw) else {
+                print("!!!!!! ERROR: Unsupported tensor type raw value \(typeRaw) read for tensor '\(name)' at offset \(typeReadOffset). Bytes were: \(typeBytesString)")
+                throw GGUFError.unsupportedType(typeRaw)
+            }
+
+            let dataOffset: UInt64 = try read() // Relative offset
+
+            // Optional: Full debug log per tensor if needed
+            // print("""
+            // ------ Tensor #\(i+1) Parsed:
+            //        Name: '\(name)'
+            //        NDims: \(nDims)
+            //        Dims: \(dims)
+            //        Type: \(type) (\(typeRaw))
+            //        RelOffset: \(dataOffset)
+            // """)
+
+            tensors.append(
+                GGUFTensorDescriptor(name: name, dims: dims, type: type, offset: dataOffset)
+            )
         }
         print("--- Debug: Finished reading tensor descriptors.")
         return tensors
@@ -612,32 +519,26 @@ class DataReader {
             guard val == 0 || val == 1 else { throw GGUFError.invalidSize(Int(val), expected: 1) }
             valueResult = .bool(val == 1)
         case 8:  // STRING
-            // No extra logging here, readString handles its own check
             valueResult = .string(try readString())
         case 9:  // ARRAY
             let arrType: UInt32 = try read()
             let arrLength: UInt64 = try read()
             let arrayMetaOffset = offset // Offset *before* reading any elements
 
-            // Log start of array reading only if printDebug is true for the parent metadata item
             if printDebug {
                 print("--- Debug [Array for key '\(keyHint)']: Type=\(arrType), Length=\(arrLength). Offset before elements: \(arrayMetaOffset)")
             }
 
             var arr: [GGUFValue] = []
             guard arrLength <= 5_000_000 else {
-                print(
-                    "Error: Array length \(arrLength) for key '\(keyHint)' seems excessively large."
-                )
+                print("Error: Array length \(arrLength) for key '\(keyHint)' seems excessively large.")
                 throw GGUFError.invalidSize(Int(clamping: arrLength), expected: 5_000_000)
             }
             arr.reserveCapacity(Int(clamping: arrLength))  // Good practice
 
             for i in 0..<arrLength {
-                // Minimal inner loop logging (optional)
-                let elementStartOffset = offset
                 if printDebug && (i < 2 || i >= arrLength - 2) { // First/last 2
-                    print("--- Debug [Array '\(keyHint)' Elem \(i+1)/\(arrLength)]: Reading at offset \(elementStartOffset)")
+                    print("--- Debug [Array '\(keyHint)' Elem \(i+1)/\(arrLength)]: Reading at offset \(offset)")
                 }
 
                 switch arrType {
@@ -646,17 +547,14 @@ class DataReader {
                     let int32Val: Int32 = try read()
                     arr.append(.uint32(UInt32(bitPattern: int32Val)))
                 case 6: arr.append(.float32(try read()))
-                case 8: arr.append(.string(try readString())) // Minimal logging inside
+                case 8: arr.append(.string(try readString()))
                 default:
-                    print(
-                        "Error: Unsupported array element type \(arrType) at offset \(offset) for key '\(keyHint)'"
-                    )
+                    print("Error: Unsupported array element type \(arrType) at offset \(offset) for key '\(keyHint)'")
                     throw GGUFError.unsupportedType(arrType)
                 }
             }
             let arrayEndOffset = offset // Offset *after* reading all elements
 
-            // Log end of array reading only if printDebug is true
             if printDebug {
                 print("--- Debug [Array for key '\(keyHint)']: Finished reading array elements. Offset now: \(arrayEndOffset). Total bytes read for elements: \(arrayEndOffset - arrayMetaOffset)")
             }
@@ -667,15 +565,10 @@ class DataReader {
             valueResult = .uint64(UInt64(bitPattern: val))
         case 12: valueResult = .float64(try read())
         default:
-            print(
-                "Error: Unsupported metadata value type \(type) at offset \(offset) for key '\(keyHint)'"
-            )
+            print("Error: Unsupported metadata value type \(type) at offset \(offset) for key '\(keyHint)'")
             throw GGUFError.unsupportedType(type)
         }
-        // Optional: Log after value read IF it wasn't an array (arrays logged their own end)
-        if printDebug && type != 9 {
-            print("--- Debug [Value Read for key '\(keyHint)']: Type=\(type). Offset AFTER value read: \(offset)")
-        }
+
         return valueResult
     }
 }

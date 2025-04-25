@@ -47,6 +47,16 @@ struct ContentView: View {
             .disabled(selectedFileURL == nil || isLoading) // Disable if no file or loading
             .padding(.top, 5)
 
+            // --- Button to Dequantize Specific Tensor ---
+            Button("Load & Dequantize F64 Tensor") {
+                Task {
+                    // *** Target an F64 (Type 12) tensor name ***
+                    let targetTensorName = "token_embd.weight" // Or blk.0.ffn_gate.weight etc.
+                    await loadAndDequantizeSpecific(tensorName: targetTensorName)
+                }
+            }
+            .disabled(selectedFileURL == nil || isLoading)
+            .padding(.top, 5)
 
             Divider() // Visually separate controls from status/output
 
@@ -131,7 +141,7 @@ struct ContentView: View {
         // For clarity, we can use Task.detached or a Task running on a global executor.
         // However, since ModelLoader methods might switch threads internally (e.g., Metal),
         // we just need to ensure calls TO the @MainActor wrapper are done correctly.
-        
+
         // We'll call the wrapper's methods which are @MainActor isolated.
         // Swift concurrency handles the context switching.
         do {
@@ -173,6 +183,64 @@ struct ContentView: View {
         }
 
         // Final UI updates (already on MainActor)
+        statusMessage = finalMessage
+        dequantizedValues = finalValues
+        isLoading = false
+    }
+
+    // New async function to handle specific tensor dequantization
+    @MainActor
+    private func loadAndDequantizeSpecific(tensorName: String) async {
+        guard let urlToLoad = selectedFileURL else {
+            statusMessage = "Error: No file selected to load."
+            return
+        }
+
+        isLoading = true
+        statusMessage = "Loading GGUF metadata..."
+        dequantizedValues = nil
+
+        var finalMessage: String
+        var finalValues: [Float]? = nil
+
+        do {
+            // Step 1: Load model metadata (if not already loaded or to ensure fresh state)
+            // You might optimize this later to avoid reloading if url hasn't changed.
+            try await modelLoaderWrapper.loadModel(url: urlToLoad)
+            finalMessage = "Model loaded. Dequantizing tensor '\(tensorName)'..."
+            statusMessage = finalMessage
+
+            // Step 2: Dequantize the SPECIFIC tensor
+            finalValues = try await modelLoaderWrapper.dequantizeTensorByName(name: tensorName) // Call the new function
+            finalMessage = modelLoaderWrapper.currentStatus
+
+        } catch let error as ModelLoaderError {
+             // Handle specific ModelLoader errors
+             switch error {
+             case .modelNotLoaded: finalMessage = "Error: Model wasn't loaded before dequantization."
+             case .tensorNotFound(let name): finalMessage = "Error: Tensor '\(name)' not found."
+             case .failedToGetTensorData(let name): finalMessage = "Error: Couldn't get data for tensor '\(name)'."
+             case .failedToCreateMetalBuffer(let name): finalMessage = "Error: Couldn't create Metal buffer for '\(name)'."
+             case .dequantizationFailed(let name, let underlyingError):
+                  finalMessage = "Error: Dequantization failed for '\(name)'."
+                  if let underlyingError = underlyingError {
+                      finalMessage += " (\(underlyingError.localizedDescription))"
+                  }
+             case .unsupportedTensorType(let name, let type): finalMessage = "Error: Unsupported tensor type '\(type)' for tensor '\(name)'."
+             case .metalServiceUnavailable: finalMessage = "Error: Metal service is unavailable."
+             }
+             print("Caught ModelLoaderError: \(finalMessage)") // Log details
+        } catch let error as GGUFError {
+             // Handle specific GGUF parsing errors from loadModel
+             finalMessage = "Error parsing GGUF file: \(error)" // Customize based on GGUFError cases
+             print("Caught GGUFError: \(finalMessage)")
+        } catch {
+             // Handle any other unexpected errors
+             finalMessage = "An unexpected error occurred: \(error.localizedDescription)"
+             print("Caught unexpected error: \(finalMessage)")
+        }
+
+        // Final UI updates
         statusMessage = finalMessage
         dequantizedValues = finalValues
         isLoading = false
@@ -238,7 +306,7 @@ class ModelLoaderWrapper: ObservableObject {
         // We can make ModelLoader.dequantizeTensor async or wrap the call here.
         // Let's assume ModelLoader.dequantizeTensor can be called and might block
         // or use its own async pattern. For safety, wrap in Task.
-        
+
         // *** Option 1: Make ModelLoader.dequantizeTensor async (Preferred) ***
         // If ModelLoader.dequantizeTensor is marked async:
         // let dequantizedBuffer = try await loader.dequantizeTensor(tensorName: firstTensorName, outputType: .f32)
@@ -270,6 +338,61 @@ class ModelLoaderWrapper: ObservableObject {
         let values = Array(UnsafeBufferPointer(start: pointer, count: valuesToRead))
 
         currentStatus = "Successfully dequantized '\(firstTensorName)'."
+        return values
+    }
+
+    /// Dequantizes a tensor by the specified name. Now async.
+    func dequantizeTensorByName(name tensorName: String) async throws -> [Float]? { // Renamed and added parameter
+        guard let loader = self.modelLoader else {
+            currentStatus = "Error: No model loaded."
+            throw ModelLoaderError.modelNotLoaded
+        }
+        // Find the tensor descriptor (optional, but good for getting element count)
+        guard let tensorDesc = loader.getTensorDescriptor(name: tensorName) else {
+            currentStatus = "Error: Tensor '\(tensorName)' not found in loaded model."
+            throw ModelLoaderError.tensorNotFound(tensorName)
+        }
+
+        print("Attempting to dequantize tensor: \(tensorName)")
+        currentStatus = "Dequantizing \(tensorName)..."
+
+        // Dequantize the specified tensor to F32
+        let dequantizedBuffer = try await Task { // Run potentially blocking work in background Task
+            try loader.dequantizeTensor(tensorName: tensorName, outputType: .f32)
+        }.value
+
+        print("Tensor dequantized successfully. Reading back values...")
+        currentStatus = "Reading back values for \(tensorName)..."
+
+        let elementCount = Int(tensorDesc.elementCount) // Use descriptor for count
+        let valuesToRead = min(elementCount, 10) // Read first 10 again
+
+        guard valuesToRead > 0 else {
+            currentStatus = "Tensor '\(tensorName)' dequantized (0 elements)."
+            return []
+        }
+        let expectedBufferSize = valuesToRead * MemoryLayout<Float>.size
+        guard dequantizedBuffer.length >= expectedBufferSize else {
+             currentStatus = "Error: Dequantized buffer size (\(dequantizedBuffer.length)) is too small for \(valuesToRead) floats (expected at least \(expectedBufferSize))."
+             // It's possible elementCount was wrong, or dequantization failed silently.
+             // Let's try reading what we can, up to buffer length.
+             let actualFloatsReadable = dequantizedBuffer.length / MemoryLayout<Float>.size
+             if actualFloatsReadable == 0 {
+                 print("Buffer length \(dequantizedBuffer.length) is less than one float.")
+                 throw ModelLoaderError.dequantizationFailed(tensorName, nil)
+             }
+             print("Warning: Buffer size mismatch. Reading only \(actualFloatsReadable) floats.")
+             let pointer = dequantizedBuffer.contents().bindMemory(to: Float.self, capacity: actualFloatsReadable)
+             let values = Array(UnsafeBufferPointer(start: pointer, count: actualFloatsReadable))
+             currentStatus = "Successfully dequantized '\(tensorName)' (Warning: Buffer size mismatch)."
+             return values
+         }
+
+        // Reading buffer contents
+        let pointer = dequantizedBuffer.contents().bindMemory(to: Float.self, capacity: valuesToRead)
+        let values = Array(UnsafeBufferPointer(start: pointer, count: valuesToRead))
+
+        currentStatus = "Successfully dequantized '\(tensorName)'."
         return values
     }
 }

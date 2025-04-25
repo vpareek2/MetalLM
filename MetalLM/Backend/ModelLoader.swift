@@ -1,5 +1,6 @@
 import Foundation
 import Metal // Required for MTLBuffer
+import Accelerate
 
 // Error types specific to ModelLoader
 enum ModelLoaderError: Error {
@@ -77,45 +78,112 @@ class ModelLoader {
     /// Uses a cache to avoid recreating buffers.
     func getQuantizedTensorBuffer(tensorName: String) throws -> MTLBuffer {
         if let cachedBuffer = quantizedBufferCache[tensorName] {
-            return cachedBuffer
+             print("Cache hit for processed tensor buffer: \(tensorName)")
+             return cachedBuffer
         }
+        print("Cache miss for processed tensor buffer: \(tensorName)")
 
-        guard ggufFile != nil else {
+        // Keep guard let, as ggufFile is used below
+        guard let ggufFile = self.ggufFile else {
             throw ModelLoaderError.modelNotLoaded
         }
         guard let tensor = getTensorDescriptor(name: tensorName) else {
             throw ModelLoaderError.tensorNotFound(tensorName)
         }
 
-        let rawData = ggufFile!.getTensorData(for: tensor)
-        guard !rawData.isEmpty else {
-            if tensor.elementCount == 0 {
-                 print("Warning: Tensor '\(tensorName)' has 0 elements, returning empty data.")
-                 guard let buffer = metalService.device.makeBuffer(length: 0, options: .storageModeShared) else {
-                     throw ModelLoaderError.failedToCreateMetalBuffer("empty buffer for \(tensorName)")
-                 }
-                 buffer.label = "\(tensorName)_empty"
-                 quantizedBufferCache[tensorName] = buffer
-                 return buffer
-            } else {
-                throw ModelLoaderError.failedToGetTensorData(tensorName)
+        // Get raw data from the GGUF file
+        let rawData = ggufFile.getTensorData(for: tensor) // Uses ggufFile
+
+        guard !rawData.isEmpty || tensor.elementCount == 0 else {
+             throw ModelLoaderError.failedToGetTensorData(tensorName)
+        }
+
+        var bufferData: Data
+        var bufferLabel = tensorName
+        let options: MTLResourceOptions = .storageModeShared
+
+        if tensor.type == .f64 {
+            print("--- CPU Conversion: Converting F64 tensor '\(tensorName)' to F32 ---")
+            let elementCount = Int(tensor.elementCount)
+            let expectedF64Size = elementCount * MemoryLayout<Double>.size
+            let expectedF32Size = elementCount * MemoryLayout<Float>.size
+
+            guard rawData.count == expectedF64Size else {
+                print("Error: F64 raw data size mismatch for \(tensorName). Expected \(expectedF64Size), got \(rawData.count)")
+                throw ModelLoaderError.failedToGetTensorData("Size mismatch for \(tensorName)")
+            }
+
+            // --- DIRECT CONVERSION TO DATA ---
+            // 1. Allocate target Data buffer for F32
+            var floatData = Data(count: expectedF32Size) // Allocate directly
+
+            // 2. Perform conversion directly into the mutable bytes of floatData
+            let conversionSuccess = floatData.withUnsafeMutableBytes { mutableF32RawBufferPtr in // Get raw mutable buffer pointer
+                rawData.withUnsafeBytes { rawF64BufferPtr in // Get raw immutable buffer pointer
+                    // Get base addresses safely
+                    guard let f64BaseAddress = rawF64BufferPtr.baseAddress,
+                          let f32BaseAddress = mutableF32RawBufferPtr.baseAddress else {
+                        print("Error: Could not get base addresses for conversion.")
+                        return false // Indicate failure
+                    }
+
+                    // Create the necessary buffer pointers explicitly
+                    let sourceBufferPtr = UnsafeBufferPointer(start: f64BaseAddress.assumingMemoryBound(to: Double.self),
+                                                              count: elementCount)
+                    // Create a MUTABLE buffer pointer for the destination
+                    var destinationBufferPtr = UnsafeMutableBufferPointer(start: f32BaseAddress.assumingMemoryBound(to: Float.self),
+                                                                          count: elementCount)
+
+                    #if canImport(Accelerate)
+                        print("--- CPU Conversion: Using Accelerate/vDSP directly into Data buffer ---")
+                        // Pass the immutable source and the mutable destination
+                        vDSP.convertElements(of: sourceBufferPtr, to: &destinationBufferPtr) // Pass destination as inout
+                    #else
+                        print("--- CPU Conversion: Using manual loop directly into Data buffer ---")
+                        // Use the buffer pointers for the loop
+                        for i in 0..<elementCount {
+                            destinationBufferPtr[i] = Float(sourceBufferPtr[i])
+                            // Add NaN/Inf check here if needed
+                        }
+                    #endif
+                    return true // Indicate success
+                }
+            }
+
+            guard conversionSuccess else {
+                // Handle the error if base addresses were nil
+                 throw ModelLoaderError.dequantizationFailed(tensorName, nil) // Or a more specific error
+            }
+            // --- END DIRECT CONVERSION ---
+
+            bufferData = floatData // Use the directly converted data
+            bufferLabel = "\(tensorName)_f64_to_f32"
+            print("--- CPU Conversion: Finished converting \(elementCount) elements for \(tensorName) ---")
+
+        } else {
+            bufferData = rawData
+        }
+
+        let bufferLength = bufferData.count
+        guard let buffer = metalService.device.makeBuffer(length: bufferLength, options: options) else {
+             throw ModelLoaderError.failedToCreateMetalBuffer(tensorName)
+        }
+        if bufferLength > 0 {
+            bufferData.withUnsafeBytes { rawBufferPointer in
+                 buffer.contents().copyMemory(from: rawBufferPointer.baseAddress!, byteCount: bufferLength)
             }
         }
 
-        guard let buffer = metalService.device.makeBuffer(bytes: rawData.withUnsafeBytes { $0.baseAddress! },
-                                                       length: rawData.count,
-                                                       options: .storageModeShared) else {
-            throw ModelLoaderError.failedToCreateMetalBuffer(tensorName)
-        }
-        buffer.label = tensorName
+        buffer.label = bufferLabel
         quantizedBufferCache[tensorName] = buffer
+        print("--- Debug [getQuantizedTensorBuffer]: Returning buffer for \(tensorName). Label: \(buffer.label ?? "nil"), Length: \(buffer.length), Type Originally: \(tensor.type)")
         return buffer
     }
 
     /// Dequantizes a specific tensor to the desired output type using Metal kernels.
     /// Handles caching of dequantized results.
     func dequantizeTensor(tensorName: String, outputType: GGUFDataType = .f32) throws -> MTLBuffer {
-        guard ggufFile != nil else {
+        guard self.ggufFile != nil else { // Just check if it exists
             throw ModelLoaderError.modelNotLoaded
         }
         guard let tensor = getTensorDescriptor(name: tensorName) else {
@@ -133,8 +201,20 @@ class ModelLoader {
         }
         print("Cache miss for dequantized tensor: \(tensorName) -> \(outputType)")
 
-        let quantizedBuffer = try getQuantizedTensorBuffer(tensorName: tensorName)
+        // Get the buffer (which might already be F32 if original was F64)
+        let sourceBuffer = try getQuantizedTensorBuffer(tensorName: tensorName)
         let elementCount = Int(tensor.elementCount)
+
+        // If the tensor was originally F64, sourceBuffer is already F32
+        if tensor.type == .f64 {
+            if outputType == .f32 {
+                print("Info: Returning pre-converted F32 buffer for originally F64 tensor '\(tensorName)'.")
+                return sourceBuffer
+            } else {
+                print("Error: Cannot produce \(outputType) output from originally F64 tensor '\(tensorName)' (only F32 supported via CPU conversion).")
+                throw ModelLoaderError.unsupportedTensorType(tensorName, outputType)
+            }
+        }
 
         guard elementCount > 0 else {
              print("Warning: Tensor '\(tensorName)' has zero elements.")
@@ -148,15 +228,15 @@ class ModelLoader {
 
         var dequantizedBuffer: MTLBuffer?
 
-        // Dispatch the appropriate Metal kernel based on the *source* tensor type
+        // --- Switch now only handles types needing GPU dequant/conversion ---
         switch tensor.type {
         case .q4_K_M:
             print("Dispatching Q4_K_M dequantization for \(tensorName) -> \(outputType)...")
             do {
                 if outputType == .f16 {
-                    dequantizedBuffer = metalService.dequantizeQ4KM_to_f16(quantizedBuffer: quantizedBuffer, elementCount: elementCount)
+                    dequantizedBuffer = metalService.dequantizeQ4KM_to_f16(quantizedBuffer: sourceBuffer, elementCount: elementCount)
                 } else { // Default to f32
-                    dequantizedBuffer = metalService.dequantizeQ4KM_to_f32(quantizedBuffer: quantizedBuffer, elementCount: elementCount)
+                    dequantizedBuffer = metalService.dequantizeQ4KM_to_f32(quantizedBuffer: sourceBuffer, elementCount: elementCount)
                 }
                 if dequantizedBuffer == nil {
                      throw ModelLoaderError.dequantizationFailed(tensorName, nil)
@@ -168,7 +248,7 @@ class ModelLoader {
         case .f16:
             if outputType == .f16 {
                  print("Info: Returning original F16 buffer for tensor '\(tensorName)'.")
-                 dequantizedBuffer = quantizedBuffer
+                 dequantizedBuffer = sourceBuffer
             } else if outputType == .f32 {
                  print("Error: F16 to F32 dequantization not implemented yet.")
                  throw ModelLoaderError.unsupportedTensorType(tensorName, .f16)
@@ -180,7 +260,7 @@ class ModelLoader {
         case .f32:
              if outputType == .f32 {
                  print("Info: Returning original F32 buffer for tensor '\(tensorName)'.")
-                 dequantizedBuffer = quantizedBuffer
+                 dequantizedBuffer = sourceBuffer
              } else if outputType == .f16 {
                   print("Error: F32 to F16 quantization not implemented yet.")
                   throw ModelLoaderError.unsupportedTensorType(tensorName, .f32)
@@ -188,22 +268,34 @@ class ModelLoader {
                   print("Error: Cannot convert F32 tensor '\(tensorName)' to \(outputType).")
                   throw ModelLoaderError.unsupportedTensorType(tensorName, outputType)
              }
-        
-        // Added default case to handle any other GGUFDataType cases
-        // This makes the switch exhaustive as required by the compiler.
-        default:
+
+        case .q4_K_S: // Added previously for parsing
+             print("Error: Dequantization for source tensor type \(tensor.type) (Q4_K_S) is not yet implemented.")
+             throw ModelLoaderError.unsupportedTensorType(tensorName, tensor.type)
+
+        case .q6_K: // Added previously for parsing
+             print("Error: Dequantization for source tensor type \(tensor.type) (Q6_K) is not yet implemented.")
+             throw ModelLoaderError.unsupportedTensorType(tensorName, tensor.type)
+
+        // NOTE: No .f64 case needed here anymore
+        default: // Should ideally not be reached if all parsed types are handled above or pre-converted
             print("Error: Dequantization for source tensor type \(tensor.type) is not supported.")
             throw ModelLoaderError.unsupportedTensorType(tensorName, tensor.type)
         }
 
         guard let finalBuffer = dequantizedBuffer else {
+             // This should ideally not happen if all paths assign or throw
              print("Internal Error: Dequantized buffer is unexpectedly nil after switch for \(tensorName).")
              throw ModelLoaderError.dequantizationFailed(tensorName, nil)
         }
 
+        // Cache the result (using the same cache key logic)
         dequantizedBufferCache[cacheKey] = finalBuffer
-        finalBuffer.label = "\(tensorName)_dequantized_\(outputType)"
-        print("Successfully dequantized and cached: \(tensorName) -> \(outputType)")
+        // Update label if conversion happened, otherwise it keeps original label
+        if finalBuffer !== sourceBuffer { // Check if it's a new buffer
+             finalBuffer.label = "\(tensorName)_converted_\(outputType)"
+        }
+        print("Successfully processed and cached: \(tensorName) -> \(outputType)")
 
         return finalBuffer
     }
