@@ -230,20 +230,21 @@ class ModelLoader {
 
         // --- Switch now only handles types needing GPU dequant/conversion ---
         switch tensor.type {
-        case .q4_K_M:
-            print("Dispatching Q4_K_M dequantization for \(tensorName) -> \(outputType)...")
-            do {
-                if outputType == .f16 {
-                    dequantizedBuffer = metalService.dequantizeQ4KM_to_f16(quantizedBuffer: sourceBuffer, elementCount: elementCount)
-                } else { // Default to f32
-                    dequantizedBuffer = metalService.dequantizeQ4KM_to_f32(quantizedBuffer: sourceBuffer, elementCount: elementCount)
-                }
-                if dequantizedBuffer == nil {
-                     throw ModelLoaderError.dequantizationFailed(tensorName, nil)
-                }
-            } catch {
-                 throw ModelLoaderError.dequantizationFailed(tensorName, error)
+        // *** Combined Q4_K_S and Q4_K_M Case ***
+        case .q4_K_S, .q4_K_M: // Handles both types 14 and 15
+            print("Dispatching Q4_K dequantization for \(tensorName) (Type: \(tensor.type.rawValue)) -> \(outputType)...")
+            // Use the existing Q4_K_M MetalService functions
+            if outputType == .f32 {
+                 dequantizedBuffer = metalService.dequantizeQ4KM_to_f32(quantizedBuffer: sourceBuffer, elementCount: elementCount)
+                 if dequantizedBuffer == nil { throw ModelLoaderError.dequantizationFailed(tensorName, nil) }
+            } else if outputType == .f16 {
+                 dequantizedBuffer = metalService.dequantizeQ4KM_to_f16(quantizedBuffer: sourceBuffer, elementCount: elementCount)
+                 if dequantizedBuffer == nil { throw ModelLoaderError.dequantizationFailed(tensorName, nil) }
+            } else {
+                 print("Error: Cannot dequantize Q4_K tensor '\(tensorName)' to \(outputType).")
+                 throw ModelLoaderError.unsupportedTensorType(tensorName, outputType)
             }
+        // *** End Combined Case ***
 
         case .f16:
             if outputType == .f16 {
@@ -269,16 +270,11 @@ class ModelLoader {
                   throw ModelLoaderError.unsupportedTensorType(tensorName, outputType)
              }
 
-        case .q4_K_S: // Added previously for parsing
-             print("Error: Dequantization for source tensor type \(tensor.type) (Q4_K_S) is not yet implemented.")
-             throw ModelLoaderError.unsupportedTensorType(tensorName, tensor.type)
-
         case .q6_K: // Added previously for parsing
              print("Error: Dequantization for source tensor type \(tensor.type) (Q6_K) is not yet implemented.")
              throw ModelLoaderError.unsupportedTensorType(tensorName, tensor.type)
-
-        // NOTE: No .f64 case needed here anymore
-        default: // Should ideally not be reached if all parsed types are handled above or pre-converted
+        // NOTE: No .f64 case needed here (handled by CPU conversion earlier)
+        default: // Catches any other types not handled above
             print("Error: Dequantization for source tensor type \(tensor.type) is not supported.")
             throw ModelLoaderError.unsupportedTensorType(tensorName, tensor.type)
         }

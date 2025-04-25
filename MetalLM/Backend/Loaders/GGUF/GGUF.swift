@@ -1,25 +1,26 @@
 import Foundation
 
 // GGUF data types
-// NOTE: Ensure these values match the GGUF spec version you are targeting.
+
+
 enum GGUFDataType: UInt32 {
     case f32 = 0
     case f16 = 1
     case f64 = 12
-    case q4_K_S = 14 // <<< ADD Q4_K_S
+    case q4_K_S = 14 // Keep enum case
     case q4_K_M = 15
     case q6_K = 18
-    // Add others from the list if needed (e.g., Q8_0 = 7, Q5_K_M = 17 etc.)
+    // Add others if needed
 
     var blockInfo: (blockSize: UInt64, blockBytes: UInt64)? {
         switch self {
         case .f32:    return (1, 4)
         case .f16:    return (1, 2)
         case .f64:    return (1, 8)
-        case .q4_K_S: return (256, 146)
+        case .q4_K_S: return (256, 144)
         case .q4_K_M: return (256, 144)
         case .q6_K:   return (256, 210)
-        // Add block info for other types if you add them to the enum
+        // Add others if needed
         }
     }
 }

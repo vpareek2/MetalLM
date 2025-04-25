@@ -2,97 +2,104 @@ import SwiftUI
 import UniformTypeIdentifiers // For UTType
 
 struct ContentView: View {
-    // Use @StateObject for the wrapper class managing our services
     @StateObject private var modelLoaderWrapper = ModelLoaderWrapper()
 
-    // State for UI feedback
     @State private var isLoading: Bool = false
     @State private var statusMessage: String = "Select a GGUF file to load."
-    @State private var dequantizedValues: [Float]? = nil // Store results for display
-    @State private var selectedFileURL: URL? = nil // Keep track of the selected file
+    @State private var dequantizedValues: [Float]? = nil
+    @State private var selectedFileURL: URL? = nil
+
+    // Define tensors to test
+    let testCases: [(label: String, tensorName: String, expectedType: String)] = [
+        ("F32", "rope_freqs.weight", "f32"),
+        ("F64->F32", "token_embd.weight", "f64"),
+        ("Q4_K_S", "blk.0.ffn_down.weight", "q4_K_S") // Type 14
+        // Add more here later, e.g., find a Q4_K_M (15) or Q6_K (18) tensor if they exist
+        // ("Q4_K_M", "some_tensor_name", "q4_K_M") // Placeholder
+    ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 15) { // Adjusted spacing
+        VStack(alignment: .leading, spacing: 15) {
             Text("MetaLLM Dequantization Test")
                 .font(.title)
                 .padding(.bottom, 5)
 
-            // File Selection Button
-            Button {
-                selectGGUFFile()
-            } label: {
-                Label("Select GGUF File...", systemImage: "folder.badge.plus")
+            // --- File Selection ---
+            HStack {
+                Button {
+                    selectGGUFFile()
+                } label: {
+                    Label("Select GGUF File...", systemImage: "folder.badge.plus")
+                }
+                Spacer() // Push button left
             }
-            .padding(.bottom, 5)
 
-            // Display selected file path
             if let url = selectedFileURL {
                 Text("Selected: \(url.lastPathComponent)")
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .font(.caption).lineLimit(1).truncationMode(.middle)
             } else {
-                Text("No file selected.")
-                    .font(.caption)
+                Text("No file selected.").font(.caption)
+            }
+            Divider()
+
+            // --- Test Buttons ---
+            Text("Run Tests:").font(.headline)
+            ScrollView(.horizontal, showsIndicators: false) { // Horizontal scroll for buttons
+                 HStack {
+                     ForEach(testCases, id: \.tensorName) { testCase in
+                         Button("Test \(testCase.label) (\(testCase.tensorName.split(separator: ".").last ?? ""))") {
+                             Task {
+                                 await loadAndDequantizeSpecific(
+                                     tensorName: testCase.tensorName,
+                                     expectedType: testCase.expectedType
+                                 )
+                             }
+                         }
+                         .disabled(selectedFileURL == nil || isLoading)
+                         .help("Test dequantization for \(testCase.tensorName) (Expected type: \(testCase.expectedType))")
+                     }
+                 }
+                 .padding(.vertical, 5)
             }
 
-            // Load and Dequantize Button (only enabled if a file is selected)
-            // Use Task to run async code from button action
-            Button("Load & Dequantize First Tensor") {
-                // Create a Task to run the async function
-                Task {
-                    await loadAndDequantize()
-                }
-            }
-            .disabled(selectedFileURL == nil || isLoading) // Disable if no file or loading
-            .padding(.top, 5)
 
-            // --- Button to Dequantize Specific Tensor ---
-            Button("Load & Dequantize F64 Tensor") {
-                Task {
-                    // *** Target an F64 (Type 12) tensor name ***
-                    let targetTensorName = "token_embd.weight" // Or blk.0.ffn_gate.weight etc.
-                    await loadAndDequantizeSpecific(tensorName: targetTensorName)
-                }
-            }
-            .disabled(selectedFileURL == nil || isLoading)
-            .padding(.top, 5)
+            Divider()
 
-            Divider() // Visually separate controls from status/output
-
-            // Display status or results
+            // --- Status and Results ---
             if isLoading {
                 ProgressView("Processing...")
                     .padding(.vertical)
             } else {
                  Text(statusMessage)
-                    .foregroundColor(statusMessage.starts(with: "Error") ? .red : .secondary) // Use secondary for normal status
+                    .foregroundColor(statusMessage.starts(with: "Error") ? .red : (statusMessage.starts(with: "Success") ? .green : .secondary))
                     .font(.footnote)
-                    .lineLimit(3) // Allow more lines for errors
+                    .lineLimit(4)
                     .padding(.vertical)
             }
-
 
             if let values = dequantizedValues {
                 Text("Dequantized Values (First ~10):")
                     .font(.headline)
-                // Use a ScrollView in case tensor names/values are long
                 ScrollView(.vertical) {
                      VStack(alignment: .leading) {
                          ForEach(0..<min(values.count, 10), id: \.self) { index in
                             Text(String(format: "[%d]: %.6f", index, values[index]))
-                                .font(.system(.body, design: .monospaced)) // Monospaced for numbers
+                                .font(.system(.body, design: .monospaced))
                         }
+                         if values.count > 10 {
+                             Text("...")
+                         }
                      }
-                     .padding(.leading, 5) // Indent values slightly
+                     .padding(.leading, 5)
                 }
-                .frame(maxHeight: 150) // Limit height of value list
+                .frame(maxHeight: 150)
+                .border(Color.gray.opacity(0.5)) // Add border for clarity
             }
 
-            Spacer() // Pushes content to the top
+            Spacer()
         }
         .padding()
-        .frame(minWidth: 450, minHeight: 400) // Give the window some size
+        .frame(minWidth: 500, minHeight: 450) // Slightly wider
     }
 
     // Function to handle file selection only (remains synchronous)
@@ -106,7 +113,7 @@ struct ContentView: View {
         if panel.runModal() == .OK {
             if let url = panel.url {
                 selectedFileURL = url // Store the selected URL
-                statusMessage = "File selected. Ready to load."
+                statusMessage = "File selected. Ready to run tests."
                 dequantizedValues = nil // Clear previous results
             } else {
                 statusMessage = "Error: Could not get URL for selected file."
@@ -188,55 +195,46 @@ struct ContentView: View {
         isLoading = false
     }
 
-    // New async function to handle specific tensor dequantization
+    // Updated async function
     @MainActor
-    private func loadAndDequantizeSpecific(tensorName: String) async {
+    private func loadAndDequantizeSpecific(tensorName: String, expectedType: String) async {
         guard let urlToLoad = selectedFileURL else {
             statusMessage = "Error: No file selected to load."
             return
         }
 
         isLoading = true
-        statusMessage = "Loading GGUF metadata..."
-        dequantizedValues = nil
+        statusMessage = "Loading GGUF metadata for \(urlToLoad.lastPathComponent)..."
+        dequantizedValues = nil // Clear previous results
 
         var finalMessage: String
         var finalValues: [Float]? = nil
 
         do {
-            // Step 1: Load model metadata (if not already loaded or to ensure fresh state)
-            // You might optimize this later to avoid reloading if url hasn't changed.
+            // Step 1: Load model metadata (clears cache internally)
             try await modelLoaderWrapper.loadModel(url: urlToLoad)
-            finalMessage = "Model loaded. Dequantizing tensor '\(tensorName)'..."
-            statusMessage = finalMessage
+            statusMessage = "Model loaded. Attempting to dequantize '\(tensorName)' (Expected: \(expectedType))..."
 
             // Step 2: Dequantize the SPECIFIC tensor
-            finalValues = try await modelLoaderWrapper.dequantizeTensorByName(name: tensorName) // Call the new function
-            finalMessage = modelLoaderWrapper.currentStatus
+            finalValues = try await modelLoaderWrapper.dequantizeTensorByName(name: tensorName)
+            // Use status from wrapper if it's detailed, otherwise craft success message
+            // finalMessage = modelLoaderWrapper.currentStatus
+            finalMessage = "Success: Dequantized '\(tensorName)'. First 10 values displayed."
+
 
         } catch let error as ModelLoaderError {
-             // Handle specific ModelLoader errors
-             switch error {
-             case .modelNotLoaded: finalMessage = "Error: Model wasn't loaded before dequantization."
-             case .tensorNotFound(let name): finalMessage = "Error: Tensor '\(name)' not found."
-             case .failedToGetTensorData(let name): finalMessage = "Error: Couldn't get data for tensor '\(name)'."
-             case .failedToCreateMetalBuffer(let name): finalMessage = "Error: Couldn't create Metal buffer for '\(name)'."
-             case .dequantizationFailed(let name, let underlyingError):
-                  finalMessage = "Error: Dequantization failed for '\(name)'."
-                  if let underlyingError = underlyingError {
-                      finalMessage += " (\(underlyingError.localizedDescription))"
-                  }
-             case .unsupportedTensorType(let name, let type): finalMessage = "Error: Unsupported tensor type '\(type)' for tensor '\(name)'."
-             case .metalServiceUnavailable: finalMessage = "Error: Metal service is unavailable."
-             }
-             print("Caught ModelLoaderError: \(finalMessage)") // Log details
+            switch error {
+            case .tensorNotFound(let name): finalMessage = "Error: Tensor '\(name)' not found."
+            case .unsupportedTensorType(let name, let type): finalMessage = "Error: Dequantization for type '\(type)' (Tensor: '\(name)') is not supported."
+            case .dequantizationFailed(let name, let underlying): finalMessage = "Error: Dequantization failed for '\(name)'" + (underlying == nil ? "." : " (\(underlying!))")
+            default: finalMessage = "ModelLoaderError: \(error)" // Catch-all for other loader errors
+            }
+             print("Caught ModelLoaderError: \(finalMessage)")
         } catch let error as GGUFError {
-             // Handle specific GGUF parsing errors from loadModel
-             finalMessage = "Error parsing GGUF file: \(error)" // Customize based on GGUFError cases
+             finalMessage = "GGUFError loading/parsing file: \(error)"
              print("Caught GGUFError: \(finalMessage)")
         } catch {
-             // Handle any other unexpected errors
-             finalMessage = "An unexpected error occurred: \(error.localizedDescription)"
+             finalMessage = "An unexpected error occurred: \(error)"
              print("Caught unexpected error: \(finalMessage)")
         }
 
@@ -275,6 +273,9 @@ class ModelLoaderWrapper: ObservableObject {
         print("Loading model from: \(url.path)")
         if self.modelLoader == nil {
              self.modelLoader = ModelLoader(metalService: metal)
+        } else {
+             // If modelLoader exists, ensure caches are cleared for a potentially new file
+             self.modelLoader?.clearCaches()
         }
 
         // Perform file loading potentially off the main thread if GGUFFile init is heavy
@@ -353,7 +354,7 @@ class ModelLoaderWrapper: ObservableObject {
             throw ModelLoaderError.tensorNotFound(tensorName)
         }
 
-        print("Attempting to dequantize tensor: \(tensorName)")
+        print("Attempting to dequantize tensor: \(tensorName) (Type: \(tensorDesc.type))")
         currentStatus = "Dequantizing \(tensorName)..."
 
         // Dequantize the specified tensor to F32
