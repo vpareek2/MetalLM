@@ -94,15 +94,221 @@ class MetalService {
 
     // MARK: - Dequantization Functions
     // (Keep dequantizeQ4KM_to_f32 and dequantizeQ4KM_to_f16 as they handle both S and M)
-    func dequantizeQ4KM_to_f32(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer?
-    { /* ... as before ... */  }
-    func dequantizeQ4KM_to_f16(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer?
-    { /* ... as before ... */  }
+
+    /// Dequantizes a Q4_K_M buffer into a new Float32 buffer using Metal.
+    /// Handles both Q4_K_M and Q4_K_S types as they share the kernel.
+    func dequantizeQ4KM_to_f32(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
+        guard elementCount > 0 else {
+            print("Warning: Attempting Q4_K -> F32 dequantization with zero elements.")
+            return device.makeBuffer(length: 0, options: .storageModeShared)
+        }
+
+        // Basic size validation (using 144 bytes per block for Q4_K_M/S)
+        let expectedInputSize = ((elementCount + 255) / 256) * 144
+        guard quantizedBuffer.length >= expectedInputSize else {
+            print(
+                "Error: Input Q4_K buffer length (\(quantizedBuffer.length)) is less than expected (\(expectedInputSize)) for \(elementCount) elements."
+            )
+            return nil
+        }
+
+        // Calculate output buffer size
+        let outputBufferSize = elementCount * MemoryLayout<Float>.size
+        guard
+            let outputBuffer = device.makeBuffer(
+                length: outputBufferSize, options: .storageModeShared)
+        else {
+            print("Error: Failed to create output buffer for Q4_K -> F32 dequantization.")
+            return nil
+        }
+        outputBuffer.label = (quantizedBuffer.label ?? "unknown") + "_q4k_f32"
+
+        // Create buffer for element count argument
+        var nelementsArg = UInt64(elementCount)
+        guard
+            let nelementsBuffer = device.makeBuffer(
+                bytes: &nelementsArg,
+                length: MemoryLayout<UInt64>.size,
+                options: .storageModeShared)
+        else {
+            print("Error: Failed to create nelements buffer for Q4_K -> F32 dequantization.")
+            return nil
+        }
+
+        // Encode and dispatch kernel
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            print("Error: Failed to create command buffer or encoder for Q4_K -> F32.")
+            return nil
+        }
+        encoder.label = "Q4K -> F32 Encoder"
+
+        encoder.setComputePipelineState(dequantizeQ4KMF32PipelineState)  // Use the M pipeline state for both M & S
+        encoder.setBuffer(quantizedBuffer, offset: 0, index: 0)  // src
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // nelements
+
+        let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
+        let threadGroupWidth = min(
+            dequantizeQ4KMF32PipelineState.maxTotalThreadsPerThreadgroup, 256)  // 256 is often reasonable
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()  // Wait for simplicity
+
+        if let error = commandBuffer.error {
+            print("Error during Q4_K -> f32 dequantization kernel execution: \(error)")
+            return nil
+        }
+        print("Successfully executed Q4_K -> F32 dequantization kernel.")
+        return outputBuffer
+    }
+
+    /// Dequantizes a Q4_K_M buffer into a new Float16 buffer using Metal.
+    /// Handles both Q4_K_M and Q4_K_S types as they share the kernel.
+    func dequantizeQ4KM_to_f16(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
+        guard elementCount > 0 else {
+            print("Warning: Attempting Q4_K -> F16 dequantization with zero elements.")
+            return device.makeBuffer(length: 0, options: .storageModeShared)
+        }
+
+        // Basic size validation (using 144 bytes per block for Q4_K_M/S)
+        let expectedInputSize = ((elementCount + 255) / 256) * 144
+        guard quantizedBuffer.length >= expectedInputSize else {
+            print(
+                "Error: Input Q4_K buffer length (\(quantizedBuffer.length)) is less than expected (\(expectedInputSize)) for \(elementCount) elements."
+            )
+            return nil
+        }
+
+        // Calculate output buffer size
+        let outputBufferSize = elementCount * MemoryLayout<Float16>.size  // Use Float16 size
+        guard
+            let outputBuffer = device.makeBuffer(
+                length: outputBufferSize, options: .storageModeShared)
+        else {
+            print("Error: Failed to create output buffer for Q4_K -> F16 dequantization.")
+            return nil
+        }
+        outputBuffer.label = (quantizedBuffer.label ?? "unknown") + "_q4k_f16"
+
+        // Create buffer for element count argument
+        var nelementsArg = UInt64(elementCount)
+        guard
+            let nelementsBuffer = device.makeBuffer(
+                bytes: &nelementsArg,
+                length: MemoryLayout<UInt64>.size,
+                options: .storageModeShared)
+        else {
+            print("Error: Failed to create nelements buffer for Q4_K -> F16 dequantization.")
+            return nil
+        }
+
+        // Encode and dispatch kernel
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            print("Error: Failed to create command buffer or encoder for Q4_K -> F16.")
+            return nil
+        }
+        encoder.label = "Q4K -> F16 Encoder"
+
+        // Use the F16 pipeline state
+        encoder.setComputePipelineState(dequantizeQ4KMF16PipelineState)  // Use the M pipeline state for both M & S
+        encoder.setBuffer(quantizedBuffer, offset: 0, index: 0)  // src
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst (now half type)
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // nelements
+
+        let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
+        let threadGroupWidth = min(
+            dequantizeQ4KMF16PipelineState.maxTotalThreadsPerThreadgroup, 256)
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()  // Wait for simplicity
+
+        if let error = commandBuffer.error {
+            print("Error during Q4_K -> f16 dequantization kernel execution: \(error)")
+            return nil
+        }
+        print("Successfully executed Q4_K -> F16 dequantization kernel.")
+        return outputBuffer
+    }
 
     // MARK: - Conversion Functions
     // (Keep convertF16toF32)
-    func convertF16toF32(inputBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer?
-    { /* ... as before ... */  }
+
+    /// Converts an F16 buffer into a new F32 buffer using Metal.
+    func convertF16toF32(inputBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
+        guard elementCount > 0 else {
+            print("Warning: Attempting F16 -> F32 conversion with zero elements.")
+            return device.makeBuffer(length: 0, options: .storageModeShared)
+        }
+
+        let expectedInputSize = elementCount * MemoryLayout<Float16>.size
+        guard inputBuffer.length >= expectedInputSize else {
+            print(
+                "Error: Input F16 buffer length (\(inputBuffer.length)) is less than expected (\(expectedInputSize)) for \(elementCount) elements."
+            )
+            return nil
+        }
+
+        let outputBufferSize = elementCount * MemoryLayout<Float>.size
+        guard
+            let outputBuffer = device.makeBuffer(
+                length: outputBufferSize, options: .storageModeShared)
+        else {
+            print("Error: Failed to create output buffer for F16->F32 conversion.")
+            return nil
+        }
+        outputBuffer.label = (inputBuffer.label ?? "unknown") + "_f16_to_f32"
+
+        var nelementsArg = UInt64(elementCount)
+        guard
+            let nelementsBuffer = device.makeBuffer(
+                bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared
+            )
+        else {
+            print("Error: Failed to create nelements buffer for F16->F32 conversion.")
+            return nil
+        }
+
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            print("Error: Failed to create command buffer or encoder for F16->F32 conversion.")
+            return nil
+        }
+        encoder.label = "F16 -> F32 Encoder"
+
+        encoder.setComputePipelineState(convertF16toF32PipelineState)  // Use F16->F32 pipeline
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)  // src (f16)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst (f32)
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // elementCount
+
+        let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
+        let threadGroupWidth = min(convertF16toF32PipelineState.maxTotalThreadsPerThreadgroup, 1024)  // Can be higher for simple conversions
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()  // Wait for simplicity
+
+        if let error = commandBuffer.error {
+            print("Error during F16->F32 conversion kernel execution: \(error)")
+            return nil
+        }
+        print("Successfully executed F16->F32 conversion kernel.")
+        return outputBuffer
+    }
 
     // MARK: - Inference Op Functions
     func rmsNormF16(
