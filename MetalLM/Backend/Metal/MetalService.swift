@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MetalPerformanceShaders  // <-- IMPORT MPS
 
 // Argument struct for RMSNorm kernel
 // (Can also be defined globally or in a shared header/file)
@@ -549,5 +550,123 @@ class MetalService {
     private func flsl(_ n: Int) -> Int {
         guard n > 0 else { return 0 }
         return Int.bitWidth - n.leadingZeroBitCount
+    }
+
+    // MARK: - Matrix Multiplication (MPS) - NEW SECTION
+
+    /// Performs matrix multiplication C = A * B using MPS, assuming Float16 precision.
+    ///
+    /// - Parameters:
+    ///   - commandBuffer: The command buffer to encode the operation into.
+    ///   - inputA: Buffer containing matrix A data (MxK elements).
+    ///   - inputB: Buffer containing matrix B data (KxN elements).
+    ///   - outputC: Buffer where matrix C result (MxN elements) will be written.
+    ///   - M: Number of rows in matrix A and C.
+    ///   - N: Number of columns in matrix B and C.
+    ///   - K: Number of columns in matrix A and rows in matrix B.
+    ///   - transposeA: Whether to transpose matrix A before multiplication. Defaults to false.
+    ///   - transposeB: Whether to transpose matrix B before multiplication. Defaults to false.
+    /// - Returns: `true` if the kernel was encoded successfully, `false` otherwise.
+    func matrixMultiplyF16(
+        commandBuffer: MTLCommandBuffer,
+        inputA: MTLBuffer,
+        inputB: MTLBuffer,
+        outputC: MTLBuffer,
+        M: Int,
+        N: Int,
+        K: Int,
+        transposeA: Bool = false,
+        transposeB: Bool = false
+    ) -> Bool {
+
+        guard M > 0, N > 0, K > 0 else {
+            print("Error [MatMulMPS]: Invalid dimensions M=\(M), N=\(N), K=\(K).")
+            return false
+        }
+
+        let dataType = MPSDataType.float16
+        // Use stride which includes padding, might be safer if Metal adds padding.
+        // Or use MemoryLayout<Float16>.size if data is guaranteed packed. Let's stick to size for now.
+        let bytesPerElement = MemoryLayout<Float16>.size
+
+        // --- 1. Validate Buffer Sizes ---
+        let rowsA = transposeA ? K : M
+        let colsA = transposeA ? M : K
+        let rowsB = transposeB ? N : K
+        let colsB = transposeB ? K : N
+
+        // Calculate minimum required bytes based on logical dimensions
+        // Note: MPS might require buffer sizes aligned to certain boundaries depending on the hardware/kernel,
+        // but these basic checks catch obvious errors.
+        let requiredBytesA = M * K * bytesPerElement  // Size based on logical MxK before transpose
+        let requiredBytesB = K * N * bytesPerElement  // Size based on logical KxN before transpose
+        let requiredBytesC = M * N * bytesPerElement  // Size based on logical MxN
+
+        guard inputA.length >= requiredBytesA else {
+            print(
+                "Error [MatMulMPS]: inputA buffer too small. Has \(inputA.length), needs at least \(requiredBytesA) for \(M)x\(K)."
+            )
+            return false
+        }
+        guard inputB.length >= requiredBytesB else {
+            print(
+                "Error [MatMulMPS]: inputB buffer too small. Has \(inputB.length), needs at least \(requiredBytesB) for \(K)x\(N)."
+            )
+            return false
+        }
+        guard outputC.length >= requiredBytesC else {
+            print(
+                "Error [MatMulMPS]: outputC buffer too small. Has \(outputC.length), needs at least \(requiredBytesC) for \(M)x\(N)."
+            )
+            return false
+        }
+
+        // --- 2. Create MPSMatrixDescriptors ---
+        // Calculate rowBytes assuming tightly packed data. If your data had padding, adjust this.
+        // For A (MxK): K elements per row * bytes per element
+        let rowBytesA = K * bytesPerElement
+        // For B (KxN): N elements per row * bytes per element
+        let rowBytesB = N * bytesPerElement
+        // For C (MxN): N elements per row * bytes per element
+        let rowBytesC = N * bytesPerElement
+
+        // *** FIX: Remove guard let, create directly ***
+        let descA = MPSMatrixDescriptor(
+            rows: M, columns: K, rowBytes: rowBytesA, dataType: dataType)
+        let descB = MPSMatrixDescriptor(
+            rows: K, columns: N, rowBytes: rowBytesB, dataType: dataType)
+        let descC = MPSMatrixDescriptor(
+            rows: M, columns: N, rowBytes: rowBytesC, dataType: dataType)
+        // *** END FIX ***
+
+        // --- 3. Create MPSMatrix Objects ---
+        let matrixA = MPSMatrix(buffer: inputA, descriptor: descA)
+        let matrixB = MPSMatrix(buffer: inputB, descriptor: descB)
+        let matrixC = MPSMatrix(buffer: outputC, descriptor: descC)
+
+        // --- 4. Create MPSMatrixMultiplication Kernel ---
+        let mpsMatMulKernel = MPSMatrixMultiplication(
+            device: self.device,
+            transposeLeft: transposeA,
+            transposeRight: transposeB,
+            resultRows: M,
+            resultColumns: N,
+            interiorColumns: K,
+            alpha: 1.0,
+            beta: 0.0
+        )
+
+        // --- 5. Encode the Kernel ---
+        mpsMatMulKernel.encode(
+            commandBuffer: commandBuffer,
+            leftMatrix: matrixA,
+            rightMatrix: matrixB,
+            resultMatrix: matrixC
+        )
+
+        print(
+            "Successfully encoded MPS MatMul F16: (\(M)x\(K)) * (\(K)x\(N)) -> (\(M)x\(N)), tA=\(transposeA), tB=\(transposeB)"
+        )
+        return true
     }
 }
