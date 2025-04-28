@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		0D63790B2DC0362100961EF0 /* MetalPerformanceShaders.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0D63790A2DC0362100961EF0 /* MetalPerformanceShaders.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		0DA7B0BF2DBAD9F8003EE6FC /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -24,6 +28,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		0D63790A2DC0362100961EF0 /* MetalPerformanceShaders.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalPerformanceShaders.framework; path = System/Library/Frameworks/MetalPerformanceShaders.framework; sourceTree = SDKROOT; };
 		0DA7B0AD2DBAD9F7003EE6FC /* MetalLM.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MetalLM.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		0DA7B0BE2DBAD9F8003EE6FC /* MetalLMTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MetalLMTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		0DA7B0C82DBAD9F8003EE6FC /* MetalLMUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MetalLMUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -52,6 +57,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0D63790B2DC0362100961EF0 /* MetalPerformanceShaders.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -72,12 +78,21 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		0D6379092DC0362100961EF0 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				0D63790A2DC0362100961EF0 /* MetalPerformanceShaders.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		0DA7B0A42DBAD9F7003EE6FC = {
 			isa = PBXGroup;
 			children = (
 				0DA7B0AF2DBAD9F7003EE6FC /* MetalLM */,
 				0DA7B0C12DBAD9F8003EE6FC /* MetalLMTests */,
 				0DA7B0CB2DBAD9F8003EE6FC /* MetalLMUITests */,
+				0D6379092DC0362100961EF0 /* Frameworks */,
 				0DA7B0AE2DBAD9F7003EE6FC /* Products */,
 			);
 			sourceTree = "<group>";

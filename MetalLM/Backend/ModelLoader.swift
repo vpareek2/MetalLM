@@ -264,11 +264,12 @@ class ModelLoader {
                 quantizedBuffer: sourceBuffer, elementCount: elementCount)  // Keep using combined kernel func
 
         // Q6_K Dequantization (Type 14)
-        case (.q6_K, .f16), (.q6_K, .f32):
-            print(
-                "Error: Dequantization for Q6_K tensor '\(tensorName)' to \(outputType) is not yet implemented."
-            )
-            throw ModelLoaderError.unsupportedTensorType(tensorName, .q6_K)  // Correctly identify as Q6_K
+        case (.q6_K, .f32):
+            processedBuffer = metalService.dequantizeQ6K_to_f32(
+                quantizedBuffer: sourceBuffer, elementCount: elementCount)  // Call new func
+        case (.q6_K, .f16):
+            processedBuffer = metalService.dequantizeQ6K_to_f16(
+                quantizedBuffer: sourceBuffer, elementCount: elementCount)  // Call new func
 
         // F16 Conversion (Type 1)
         case (.f16, .f32):

@@ -24,6 +24,8 @@ class MetalService {
     // Pipeline states for different kernels
     let dequantizeQ4KMF32PipelineState: MTLComputePipelineState  // Handles Q4_K_M AND Q4_K_S
     let dequantizeQ4KMF16PipelineState: MTLComputePipelineState  // Handles Q4_K_M AND Q4_K_S
+    let dequantizeQ6KF32PipelineState: MTLComputePipelineState  // <-- ADD
+    let dequantizeQ6KF16PipelineState: MTLComputePipelineState  // <-- ADD
     let convertF16toF32PipelineState: MTLComputePipelineState
     let rmsNormF16PipelineState: MTLComputePipelineState
 
@@ -70,6 +72,16 @@ class MetalService {
             self.dequantizeQ4KMF16PipelineState = try makePipeline(
                 functionName: "kernel_dequantize_q4_K_f16")
             print("Pipeline state created for kernel_dequantize_q4_K_f16")
+
+            // *** ADD Q6_K Pipelines ***
+            self.dequantizeQ6KF32PipelineState = try makePipeline(
+                functionName: "kernel_dequantize_q6_K_f32")
+            print("Pipeline state created for kernel_dequantize_q6_K_f32")
+
+            self.dequantizeQ6KF16PipelineState = try makePipeline(
+                functionName: "kernel_dequantize_q6_K_f16")
+            print("Pipeline state created for kernel_dequantize_q6_K_f16")
+            // *** END ADD ***
 
             self.convertF16toF32PipelineState = try makePipeline(
                 functionName: "kernel_convert_f16_f32")
@@ -241,6 +253,150 @@ class MetalService {
         print("Successfully executed Q4_K -> F16 dequantization kernel.")
         return outputBuffer
     }
+
+    // *** ADD Q6_K Functions ***
+
+    /// Dequantizes a Q6_K buffer into a new Float32 buffer using Metal.
+    func dequantizeQ6K_to_f32(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
+        guard elementCount > 0 else {
+            print("Warning: Attempting Q6_K -> F32 dequantization with zero elements.")
+            return device.makeBuffer(length: 0, options: .storageModeShared)
+        }
+
+        // Validate input size (using 210 bytes per block for Q6_K)
+        let blocks = (elementCount + 255) / 256
+        let expectedInputSize = blocks * 210
+        guard quantizedBuffer.length >= expectedInputSize else {
+            print(
+                "Error: Input Q6_K buffer length (\(quantizedBuffer.length)) is less than expected (\(expectedInputSize)) for \(elementCount) elements."
+            )
+            return nil
+        }
+
+        // Calculate output buffer size
+        let outputBufferSize = elementCount * MemoryLayout<Float>.size
+        guard
+            let outputBuffer = device.makeBuffer(
+                length: outputBufferSize, options: .storageModeShared)
+        else {
+            print("Error: Failed to create output buffer for Q6_K -> F32 dequantization.")
+            return nil
+        }
+        outputBuffer.label = (quantizedBuffer.label ?? "unknown") + "_q6k_f32"
+
+        // Element count buffer
+        var nelementsArg = UInt64(elementCount)
+        guard
+            let nelementsBuffer = device.makeBuffer(
+                bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared
+            )
+        else {
+            print("Error: Failed to create nelements buffer for Q6_K -> F32 dequantization.")
+            return nil
+        }
+
+        // Encode and dispatch kernel
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            print("Error: Failed to create command buffer or encoder for Q6_K -> F32.")
+            return nil
+        }
+        encoder.label = "Q6K -> F32 Encoder"
+
+        encoder.setComputePipelineState(dequantizeQ6KF32PipelineState)  // Use Q6_K pipeline
+        encoder.setBuffer(quantizedBuffer, offset: 0, index: 0)  // src
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // nelements
+
+        let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
+        let threadGroupWidth = min(dequantizeQ6KF32PipelineState.maxTotalThreadsPerThreadgroup, 256)
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()  // Wait for simplicity
+
+        if let error = commandBuffer.error {
+            print("Error during Q6_K -> f32 dequantization kernel execution: \(error)")
+            return nil
+        }
+        print("Successfully executed Q6_K -> F32 dequantization kernel.")
+        return outputBuffer
+    }
+
+    /// Dequantizes a Q6_K buffer into a new Float16 buffer using Metal.
+    func dequantizeQ6K_to_f16(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
+        guard elementCount > 0 else {
+            print("Warning: Attempting Q6_K -> F16 dequantization with zero elements.")
+            return device.makeBuffer(length: 0, options: .storageModeShared)
+        }
+
+        // Validate input size (using 210 bytes per block for Q6_K)
+        let blocks = (elementCount + 255) / 256
+        let expectedInputSize = blocks * 210
+        guard quantizedBuffer.length >= expectedInputSize else {
+            print(
+                "Error: Input Q6_K buffer length (\(quantizedBuffer.length)) is less than expected (\(expectedInputSize)) for \(elementCount) elements."
+            )
+            return nil
+        }
+
+        // Calculate output buffer size (Float16)
+        let outputBufferSize = elementCount * MemoryLayout<Float16>.size
+        guard
+            let outputBuffer = device.makeBuffer(
+                length: outputBufferSize, options: .storageModeShared)
+        else {
+            print("Error: Failed to create output buffer for Q6_K -> F16 dequantization.")
+            return nil
+        }
+        outputBuffer.label = (quantizedBuffer.label ?? "unknown") + "_q6k_f16"
+
+        // Element count buffer
+        var nelementsArg = UInt64(elementCount)
+        guard
+            let nelementsBuffer = device.makeBuffer(
+                bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared
+            )
+        else {
+            print("Error: Failed to create nelements buffer for Q6_K -> F16 dequantization.")
+            return nil
+        }
+
+        // Encode and dispatch kernel
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            print("Error: Failed to create command buffer or encoder for Q6_K -> F16.")
+            return nil
+        }
+        encoder.label = "Q6K -> F16 Encoder"
+
+        encoder.setComputePipelineState(dequantizeQ6KF16PipelineState)  // Use Q6_K F16 pipeline
+        encoder.setBuffer(quantizedBuffer, offset: 0, index: 0)  // src
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst (half)
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // nelements
+
+        let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
+        let threadGroupWidth = min(dequantizeQ6KF16PipelineState.maxTotalThreadsPerThreadgroup, 256)
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()  // Wait for simplicity
+
+        if let error = commandBuffer.error {
+            print("Error during Q6_K -> f16 dequantization kernel execution: \(error)")
+            return nil
+        }
+        print("Successfully executed Q6_K -> F16 dequantization kernel.")
+        return outputBuffer
+    }
+
+    // *** END ADD Q6_K ***
 
     // MARK: - Conversion Functions
     // (Keep convertF16toF32)
