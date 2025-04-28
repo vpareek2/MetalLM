@@ -410,6 +410,17 @@ class ModelLoader {
             try tensorName("output_norm.weight", nil), normWeightType)
         let outputWeightBuffer = try await getBuffer(
             try tensorName("output.weight", nil), embeddingType)  // Use embeddingType for output? Or computePrecision? Check Llama arch. Often shares type with embeddings.
+
+        var ropeFreqsBuffer: MTLBuffer? = nil
+        let ropeFreqsTensorName = "rope_freqs.weight"  // Standard name
+        if let ropeTensorDesc = self.getTensorDescriptor(name: ropeFreqsTensorName) {
+            print("Found optional RoPE frequencies tensor: \(ropeFreqsTensorName)")
+            // Load it as F32, as the kernel expects float factors
+            ropeFreqsBuffer = try await getBuffer(ropeFreqsTensorName, .f32)
+        } else {
+            print("Optional RoPE frequencies tensor '\(ropeFreqsTensorName)' not found.")
+        }
+
         print("Non-block tensors loaded.")
 
         print("Loading \(config.numLayers) transformer blocks...")
@@ -460,7 +471,8 @@ class ModelLoader {
             tokenEmbeddings: tokenEmbeddingsBuffer,
             blocks: blocks,
             finalNormWeight: finalNormWeightBuffer,
-            outputWeight: outputWeightBuffer
+            outputWeight: outputWeightBuffer,
+            ropeFrequencies: ropeFreqsBuffer  // Pass the optional buffer
         )
         print("LlamaModel assembly complete.")
         return llamaModel

@@ -171,6 +171,9 @@ class LlamaModel {
     let finalNormWeight: MTLBuffer  // Weights for the final RMSNorm after all blocks
     let outputWeight: MTLBuffer  // Output projection weights (often called lm_head) (Shape: [embed_dim, vocab_size])
 
+    // RoPE Frequencies
+    let ropeFrequencies: MTLBuffer?  // Holds factors from rope_freqs.weight (optional)
+
     // TODO: Add KV Cache structure here later for inference state
 
     /// Initializes the LlamaModel with all its components.
@@ -179,7 +182,8 @@ class LlamaModel {
         tokenEmbeddings: MTLBuffer,
         blocks: [LlamaTransformerBlock],
         finalNormWeight: MTLBuffer,
-        outputWeight: MTLBuffer
+        outputWeight: MTLBuffer,
+        ropeFrequencies: MTLBuffer?
     ) {
         precondition(
             blocks.count == config.numLayers,
@@ -189,6 +193,7 @@ class LlamaModel {
         self.blocks = blocks
         self.finalNormWeight = finalNormWeight
         self.outputWeight = outputWeight
+        self.ropeFrequencies = ropeFrequencies
 
         print("--- LlamaModel Assembled ---")
         print("  Config loaded.")
@@ -196,9 +201,9 @@ class LlamaModel {
         print("  \(blocks.count) Transformer Blocks assembled.")
         print("  Final Norm buffer assigned.")
         print("  Output Weight buffer assigned.")
+        print("  RoPE Frequencies buffer \(ropeFrequencies == nil ? "NOT " : "")assigned.")
         print("---------------------------")
     }
 
     // TODO: Add inference methods here later (e.g., forward pass)
 }
-
