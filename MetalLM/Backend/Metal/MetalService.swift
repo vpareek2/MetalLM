@@ -9,6 +9,26 @@ struct MetalRMSNormArgs {
     let ne00: UInt64
 }
 
+struct MetalRopeArgs {
+    // Match fields in the Metal struct exactly
+    var ne0: UInt32 = 0
+    var n_dims: UInt32 = 0
+    var nb0: UInt32 = 0
+    var nb1: UInt32 = 0
+    var nb2: UInt32 = 0 // Added stride
+    // var nb3: UInt32 = 0 // For batch dim later
+    var freq_base: Float = 0
+    var freq_scale: Float = 1.0 // Default to 1.0
+    var p_type: Int32 = 0
+    var pos_offset: Int32 = 0
+    // YaRN Parameters (NEW)
+    var n_ctx_orig: Int32 = 0
+    var ext_factor: Float = 0.0
+    var attn_factor: Float = 1.0
+    var beta_fast: Float = 0.0
+    var beta_slow: Float = 0.0
+}
+
 // Define the error enum here or keep it separate
 enum MetalServiceError: Error {
     case kernelNotFound(String)
@@ -18,10 +38,10 @@ enum MetalServiceError: Error {
 
 // Service class to manage Metal device, command queue, and compute pipelines
 class MetalService {
-
+    
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
-
+    
     // Pipeline states for different kernels
     let dequantizeQ4KMF32PipelineState: MTLComputePipelineState  // Handles Q4_K_M AND Q4_K_S
     let dequantizeQ4KMF16PipelineState: MTLComputePipelineState  // Handles Q4_K_M AND Q4_K_S
@@ -29,28 +49,29 @@ class MetalService {
     let dequantizeQ6KF16PipelineState: MTLComputePipelineState  // <-- ADD
     let convertF16toF32PipelineState: MTLComputePipelineState
     let rmsNormF16PipelineState: MTLComputePipelineState
-
+    let ropeF16PipelineState: MTLComputePipelineState? // Optional if kernel might fail loading
+    
     static let shared = MetalService()
-
+    
     private init?() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             print("Error: Metal is not supported on this device.")
             return nil
         }
         self.device = device
-
+        
         guard let commandQueue = device.makeCommandQueue() else {
             print("Error: Could not create Metal command queue.")
             return nil
         }
         self.commandQueue = commandQueue
-
+        
         guard let library = device.makeDefaultLibrary() else {
             print("Error: Could not load default Metal library.")
             return nil
         }
         print("Metal library loaded successfully.")
-
+        
         // --- Simplified Pipeline State Initialization ---
         do {
             // Helper to load function and create pipeline state
@@ -64,33 +85,42 @@ class MetalService {
                     throw MetalServiceError.pipelineCreationFailed(functionName, error)
                 }
             }
-
+            
             // Load all required pipelines
             self.dequantizeQ4KMF32PipelineState = try makePipeline(
                 functionName: "kernel_dequantize_q4_K_f32")
             print("Pipeline state created for kernel_dequantize_q4_K_f32")
-
+            
             self.dequantizeQ4KMF16PipelineState = try makePipeline(
                 functionName: "kernel_dequantize_q4_K_f16")
             print("Pipeline state created for kernel_dequantize_q4_K_f16")
-
+            
             // *** ADD Q6_K Pipelines ***
             self.dequantizeQ6KF32PipelineState = try makePipeline(
                 functionName: "kernel_dequantize_q6_K_f32")
             print("Pipeline state created for kernel_dequantize_q6_K_f32")
-
+            
             self.dequantizeQ6KF16PipelineState = try makePipeline(
                 functionName: "kernel_dequantize_q6_K_f16")
             print("Pipeline state created for kernel_dequantize_q6_K_f16")
             // *** END ADD ***
-
+            
             self.convertF16toF32PipelineState = try makePipeline(
                 functionName: "kernel_convert_f16_f32")
             print("Pipeline state created for kernel_convert_f16_f32")
-
+            
             self.rmsNormF16PipelineState = try makePipeline(functionName: "kernel_rms_norm_f16")
             print("Pipeline state created for kernel_rms_norm_f16")
-
+            
+            // Load RoPE pipeline state
+            if let fn = library.makeFunction(name: "kernel_rope_f16_inplace") {
+                self.ropeF16PipelineState = try device.makeComputePipelineState(function: fn)
+                print("Pipeline state created for kernel_rope_f16_inplace")
+            } else {
+                print("Error: kernel_rope_f16_inplace function not found.")
+                self.ropeF16PipelineState = nil // Or handle error more strictly
+            }
+            
         } catch let error as MetalServiceError {
             // Catch specific errors from makePipeline helper
             print("MetalService initialization failed: \(error)")
@@ -101,13 +131,13 @@ class MetalService {
             return nil
         }
         // --- End Simplified Init ---
-
+        
         print("MetalService initialized successfully for device: \(device.name)")
     }
-
+    
     // MARK: - Dequantization Functions
     // (Keep dequantizeQ4KM_to_f32 and dequantizeQ4KM_to_f16 as they handle both S and M)
-
+    
     /// Dequantizes a Q4_K_M buffer into a new Float32 buffer using Metal.
     /// Handles both Q4_K_M and Q4_K_S types as they share the kernel.
     func dequantizeQ4KM_to_f32(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
@@ -115,7 +145,7 @@ class MetalService {
             print("Warning: Attempting Q4_K -> F32 dequantization with zero elements.")
             return device.makeBuffer(length: 0, options: .storageModeShared)
         }
-
+        
         // Basic size validation (using 144 bytes per block for Q4_K_M/S)
         let expectedInputSize = ((elementCount + 255) / 256) * 144
         guard quantizedBuffer.length >= expectedInputSize else {
@@ -124,7 +154,7 @@ class MetalService {
             )
             return nil
         }
-
+        
         // Calculate output buffer size
         let outputBufferSize = elementCount * MemoryLayout<Float>.size
         guard
@@ -135,7 +165,7 @@ class MetalService {
             return nil
         }
         outputBuffer.label = (quantizedBuffer.label ?? "unknown") + "_q4k_f32"
-
+        
         // Create buffer for element count argument
         var nelementsArg = UInt64(elementCount)
         guard
@@ -147,32 +177,32 @@ class MetalService {
             print("Error: Failed to create nelements buffer for Q4_K -> F32 dequantization.")
             return nil
         }
-
+        
         // Encode and dispatch kernel
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
-            let encoder = commandBuffer.makeComputeCommandEncoder()
+              let encoder = commandBuffer.makeComputeCommandEncoder()
         else {
             print("Error: Failed to create command buffer or encoder for Q4_K -> F32.")
             return nil
         }
         encoder.label = "Q4K -> F32 Encoder"
-
+        
         encoder.setComputePipelineState(dequantizeQ4KMF32PipelineState)  // Use the M pipeline state for both M & S
         encoder.setBuffer(quantizedBuffer, offset: 0, index: 0)  // src
         encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst
         encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // nelements
-
+        
         let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
         let threadGroupWidth = min(
             dequantizeQ4KMF32PipelineState.maxTotalThreadsPerThreadgroup, 256)  // 256 is often reasonable
         let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
-
+        
         encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
-
+        
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()  // Wait for simplicity
-
+        
         if let error = commandBuffer.error {
             print("Error during Q4_K -> f32 dequantization kernel execution: \(error)")
             return nil
@@ -180,7 +210,7 @@ class MetalService {
         print("Successfully executed Q4_K -> F32 dequantization kernel.")
         return outputBuffer
     }
-
+    
     /// Dequantizes a Q4_K_M buffer into a new Float16 buffer using Metal.
     /// Handles both Q4_K_M and Q4_K_S types as they share the kernel.
     func dequantizeQ4KM_to_f16(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
@@ -188,7 +218,7 @@ class MetalService {
             print("Warning: Attempting Q4_K -> F16 dequantization with zero elements.")
             return device.makeBuffer(length: 0, options: .storageModeShared)
         }
-
+        
         // Basic size validation (using 144 bytes per block for Q4_K_M/S)
         let expectedInputSize = ((elementCount + 255) / 256) * 144
         guard quantizedBuffer.length >= expectedInputSize else {
@@ -197,7 +227,7 @@ class MetalService {
             )
             return nil
         }
-
+        
         // Calculate output buffer size
         let outputBufferSize = elementCount * MemoryLayout<Float16>.size  // Use Float16 size
         guard
@@ -208,7 +238,7 @@ class MetalService {
             return nil
         }
         outputBuffer.label = (quantizedBuffer.label ?? "unknown") + "_q4k_f16"
-
+        
         // Create buffer for element count argument
         var nelementsArg = UInt64(elementCount)
         guard
@@ -220,33 +250,33 @@ class MetalService {
             print("Error: Failed to create nelements buffer for Q4_K -> F16 dequantization.")
             return nil
         }
-
+        
         // Encode and dispatch kernel
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
-            let encoder = commandBuffer.makeComputeCommandEncoder()
+              let encoder = commandBuffer.makeComputeCommandEncoder()
         else {
             print("Error: Failed to create command buffer or encoder for Q4_K -> F16.")
             return nil
         }
         encoder.label = "Q4K -> F16 Encoder"
-
+        
         // Use the F16 pipeline state
         encoder.setComputePipelineState(dequantizeQ4KMF16PipelineState)  // Use the M pipeline state for both M & S
         encoder.setBuffer(quantizedBuffer, offset: 0, index: 0)  // src
         encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst (now half type)
         encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // nelements
-
+        
         let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
         let threadGroupWidth = min(
             dequantizeQ4KMF16PipelineState.maxTotalThreadsPerThreadgroup, 256)
         let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
-
+        
         encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
-
+        
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()  // Wait for simplicity
-
+        
         if let error = commandBuffer.error {
             print("Error during Q4_K -> f16 dequantization kernel execution: \(error)")
             return nil
@@ -254,16 +284,16 @@ class MetalService {
         print("Successfully executed Q4_K -> F16 dequantization kernel.")
         return outputBuffer
     }
-
+    
     // *** ADD Q6_K Functions ***
-
+    
     /// Dequantizes a Q6_K buffer into a new Float32 buffer using Metal.
     func dequantizeQ6K_to_f32(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
         guard elementCount > 0 else {
             print("Warning: Attempting Q6_K -> F32 dequantization with zero elements.")
             return device.makeBuffer(length: 0, options: .storageModeShared)
         }
-
+        
         // Validate input size (using 210 bytes per block for Q6_K)
         let blocks = (elementCount + 255) / 256
         let expectedInputSize = blocks * 210
@@ -273,7 +303,7 @@ class MetalService {
             )
             return nil
         }
-
+        
         // Calculate output buffer size
         let outputBufferSize = elementCount * MemoryLayout<Float>.size
         guard
@@ -284,7 +314,7 @@ class MetalService {
             return nil
         }
         outputBuffer.label = (quantizedBuffer.label ?? "unknown") + "_q6k_f32"
-
+        
         // Element count buffer
         var nelementsArg = UInt64(elementCount)
         guard
@@ -295,30 +325,30 @@ class MetalService {
             print("Error: Failed to create nelements buffer for Q6_K -> F32 dequantization.")
             return nil
         }
-
+        
         // Encode and dispatch kernel
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
-            let encoder = commandBuffer.makeComputeCommandEncoder()
+              let encoder = commandBuffer.makeComputeCommandEncoder()
         else {
             print("Error: Failed to create command buffer or encoder for Q6_K -> F32.")
             return nil
         }
         encoder.label = "Q6K -> F32 Encoder"
-
+        
         encoder.setComputePipelineState(dequantizeQ6KF32PipelineState)  // Use Q6_K pipeline
         encoder.setBuffer(quantizedBuffer, offset: 0, index: 0)  // src
         encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst
         encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // nelements
-
+        
         let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
         let threadGroupWidth = min(dequantizeQ6KF32PipelineState.maxTotalThreadsPerThreadgroup, 256)
         let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
-
+        
         encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()  // Wait for simplicity
-
+        
         if let error = commandBuffer.error {
             print("Error during Q6_K -> f32 dequantization kernel execution: \(error)")
             return nil
@@ -326,14 +356,14 @@ class MetalService {
         print("Successfully executed Q6_K -> F32 dequantization kernel.")
         return outputBuffer
     }
-
+    
     /// Dequantizes a Q6_K buffer into a new Float16 buffer using Metal.
     func dequantizeQ6K_to_f16(quantizedBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
         guard elementCount > 0 else {
             print("Warning: Attempting Q6_K -> F16 dequantization with zero elements.")
             return device.makeBuffer(length: 0, options: .storageModeShared)
         }
-
+        
         // Validate input size (using 210 bytes per block for Q6_K)
         let blocks = (elementCount + 255) / 256
         let expectedInputSize = blocks * 210
@@ -343,7 +373,7 @@ class MetalService {
             )
             return nil
         }
-
+        
         // Calculate output buffer size (Float16)
         let outputBufferSize = elementCount * MemoryLayout<Float16>.size
         guard
@@ -354,7 +384,7 @@ class MetalService {
             return nil
         }
         outputBuffer.label = (quantizedBuffer.label ?? "unknown") + "_q6k_f16"
-
+        
         // Element count buffer
         var nelementsArg = UInt64(elementCount)
         guard
@@ -365,30 +395,30 @@ class MetalService {
             print("Error: Failed to create nelements buffer for Q6_K -> F16 dequantization.")
             return nil
         }
-
+        
         // Encode and dispatch kernel
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
-            let encoder = commandBuffer.makeComputeCommandEncoder()
+              let encoder = commandBuffer.makeComputeCommandEncoder()
         else {
             print("Error: Failed to create command buffer or encoder for Q6_K -> F16.")
             return nil
         }
         encoder.label = "Q6K -> F16 Encoder"
-
+        
         encoder.setComputePipelineState(dequantizeQ6KF16PipelineState)  // Use Q6_K F16 pipeline
         encoder.setBuffer(quantizedBuffer, offset: 0, index: 0)  // src
         encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst (half)
         encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // nelements
-
+        
         let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
         let threadGroupWidth = min(dequantizeQ6KF16PipelineState.maxTotalThreadsPerThreadgroup, 256)
         let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
-
+        
         encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()  // Wait for simplicity
-
+        
         if let error = commandBuffer.error {
             print("Error during Q6_K -> f16 dequantization kernel execution: \(error)")
             return nil
@@ -396,19 +426,19 @@ class MetalService {
         print("Successfully executed Q6_K -> F16 dequantization kernel.")
         return outputBuffer
     }
-
+    
     // *** END ADD Q6_K ***
-
+    
     // MARK: - Conversion Functions
     // (Keep convertF16toF32)
-
+    
     /// Converts an F16 buffer into a new F32 buffer using Metal.
     func convertF16toF32(inputBuffer: MTLBuffer, elementCount: Int) -> MTLBuffer? {
         guard elementCount > 0 else {
             print("Warning: Attempting F16 -> F32 conversion with zero elements.")
             return device.makeBuffer(length: 0, options: .storageModeShared)
         }
-
+        
         let expectedInputSize = elementCount * MemoryLayout<Float16>.size
         guard inputBuffer.length >= expectedInputSize else {
             print(
@@ -416,7 +446,7 @@ class MetalService {
             )
             return nil
         }
-
+        
         let outputBufferSize = elementCount * MemoryLayout<Float>.size
         guard
             let outputBuffer = device.makeBuffer(
@@ -426,7 +456,7 @@ class MetalService {
             return nil
         }
         outputBuffer.label = (inputBuffer.label ?? "unknown") + "_f16_to_f32"
-
+        
         var nelementsArg = UInt64(elementCount)
         guard
             let nelementsBuffer = device.makeBuffer(
@@ -436,29 +466,29 @@ class MetalService {
             print("Error: Failed to create nelements buffer for F16->F32 conversion.")
             return nil
         }
-
+        
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
-            let encoder = commandBuffer.makeComputeCommandEncoder()
+              let encoder = commandBuffer.makeComputeCommandEncoder()
         else {
             print("Error: Failed to create command buffer or encoder for F16->F32 conversion.")
             return nil
         }
         encoder.label = "F16 -> F32 Encoder"
-
+        
         encoder.setComputePipelineState(convertF16toF32PipelineState)  // Use F16->F32 pipeline
         encoder.setBuffer(inputBuffer, offset: 0, index: 0)  // src (f16)
         encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst (f32)
         encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // elementCount
-
+        
         let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
         let threadGroupWidth = min(convertF16toF32PipelineState.maxTotalThreadsPerThreadgroup, 1024)  // Can be higher for simple conversions
         let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
-
+        
         encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()  // Wait for simplicity
-
+        
         if let error = commandBuffer.error {
             print("Error during F16->F32 conversion kernel execution: \(error)")
             return nil
@@ -466,7 +496,7 @@ class MetalService {
         print("Successfully executed F16->F32 conversion kernel.")
         return outputBuffer
     }
-
+    
     // MARK: - Inference Op Functions
     func rmsNormF16(
         inputBuffer: MTLBuffer,
@@ -477,18 +507,18 @@ class MetalService {
         eps: Float = 1e-5  // Corrected float literal
     ) -> Bool {
         guard rowCount > 0, elementCountPerRow > 0 else { return true }
-
+        
         let expectedInputSize = rowCount * elementCountPerRow * MemoryLayout<Float16>.size
         let expectedWeightSize = elementCountPerRow * MemoryLayout<Float16>.size
         guard inputBuffer.length >= expectedInputSize,
-            weightBuffer.length >= expectedWeightSize,
-            outputBuffer.length >= expectedInputSize
+              weightBuffer.length >= expectedWeightSize,
+              outputBuffer.length >= expectedInputSize
         else {
             print("Error [RMSNormF16]: Buffer size mismatch.")
             // ... (print details) ...
             return false
         }
-
+        
         // Use the Swift struct here when creating the buffer
         var args = MetalRMSNormArgs(eps: eps, ne00: UInt64(elementCountPerRow))
         guard
@@ -499,21 +529,21 @@ class MetalService {
             print("Error [RMSNormF16]: Failed to create args buffer.")
             return false
         }
-
+        
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
-            let encoder = commandBuffer.makeComputeCommandEncoder()
+              let encoder = commandBuffer.makeComputeCommandEncoder()
         else {
             print("Error [RMSNormF16]: Failed to create command buffer/encoder.")
             return false
         }
         encoder.label = "RMSNorm F16 Encoder"
-
+        
         encoder.setComputePipelineState(rmsNormF16PipelineState)
         encoder.setBuffer(inputBuffer, offset: 0, index: 0)  // src
         encoder.setBuffer(weightBuffer, offset: 0, index: 1)  // weight (gamma)
         encoder.setBuffer(outputBuffer, offset: 0, index: 2)  // dst
         encoder.setBuffer(argsBuffer, offset: 0, index: 3)  // args
-
+        
         let maxThreads = rmsNormF16PipelineState.maxTotalThreadsPerThreadgroup
         var threadGroupWidth = min(maxThreads, 512)
         if elementCountPerRow < threadGroupWidth {
@@ -521,15 +551,15 @@ class MetalService {
             threadGroupWidth = min(threadGroupWidth, maxThreads)
         }
         threadGroupWidth = max(32, threadGroupWidth)
-
+        
         let threadGroupMemoryLength = (threadGroupWidth > 32) ? 32 * MemoryLayout<Float>.size : 0
         if threadGroupMemoryLength > 0 {
             encoder.setThreadgroupMemoryLength(threadGroupMemoryLength, index: 0)
         }
-
+        
         let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
         let gridSize = MTLSize(width: rowCount, height: 1, depth: 1)
-
+        
         print(
             "Dispatching RMSNormF16: Grid=\(gridSize.width)x\(gridSize.height)x\(gridSize.depth), Group=\(threadGroupSize.width)x\(threadGroupSize.height)x\(threadGroupSize.depth)"
         )
@@ -537,7 +567,7 @@ class MetalService {
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-
+        
         if let error = commandBuffer.error {
             print("Error [RMSNormF16]: Kernel execution failed: \(error)")
             return false
@@ -545,128 +575,98 @@ class MetalService {
         print("Successfully executed RMSNorm F16 kernel.")  // Added success log
         return true
     }
-
-    // Helper function from rmsNormF16 (keep private)
-    private func flsl(_ n: Int) -> Int {
-        guard n > 0 else { return 0 }
-        return Int.bitWidth - n.leadingZeroBitCount
-    }
-
-    // MARK: - Matrix Multiplication (MPS) - NEW SECTION
-
-    /// Performs matrix multiplication C = A * B using MPS, assuming Float16 precision.
+    
+    // MARK: - RoPE Functions
+    
+    /// Applies Rotary Position Embeddings (RoPE) to a buffer in-place.
     ///
     /// - Parameters:
     ///   - commandBuffer: The command buffer to encode the operation into.
-    ///   - inputA: Buffer containing matrix A data (MxK elements).
-    ///   - inputB: Buffer containing matrix B data (KxN elements).
-    ///   - outputC: Buffer where matrix C result (MxN elements) will be written.
-    ///   - M: Number of rows in matrix A and C.
-    ///   - N: Number of columns in matrix B and C.
-    ///   - K: Number of columns in matrix A and rows in matrix B.
-    ///   - transposeA: Whether to transpose matrix A before multiplication. Defaults to false.
-    ///   - transposeB: Whether to transpose matrix B before multiplication. Defaults to false.
+    ///   - buffer: Buffer containing data to apply RoPE to (modified in-place).
+    ///   - ropeFrequencies: Optional buffer with precomputed frequency factors.
+    ///   - config: Configuration containing RoPE parameters.
+    ///   - posOffset: Starting position offset.
+    ///   - headDim: Size of each attention head.
+    ///   - numHeads: Number of attention heads.
+    ///   - sequenceLength: Length of the sequence dimension in the buffer.
     /// - Returns: `true` if the kernel was encoded successfully, `false` otherwise.
-    func matrixMultiplyF16(
+    func applyRoPE(
         commandBuffer: MTLCommandBuffer,
-        inputA: MTLBuffer,
-        inputB: MTLBuffer,
-        outputC: MTLBuffer,
-        M: Int,
-        N: Int,
-        K: Int,
-        transposeA: Bool = false,
-        transposeB: Bool = false
+        buffer: MTLBuffer, // In-place modification
+        ropeFrequencies: MTLBuffer?, // Optional factors buffer
+        config: LlamaConfig, // Pass config for params
+        posOffset: Int, // Starting position
+        sequenceLength: Int,
+        numHeads: Int,
+        headDim: Int
     ) -> Bool {
-
-        guard M > 0, N > 0, K > 0 else {
-            print("Error [MatMulMPS]: Invalid dimensions M=\(M), N=\(N), K=\(K).")
+        
+        guard let pipeline = ropeF16PipelineState else {
+            print("Error [RoPE]: Pipeline state not available.")
             return false
         }
-
-        let dataType = MPSDataType.float16
-        // Use stride which includes padding, might be safer if Metal adds padding.
-        // Or use MemoryLayout<Float16>.size if data is guaranteed packed. Let's stick to size for now.
-        let bytesPerElement = MemoryLayout<Float16>.size
-
-        // --- 1. Validate Buffer Sizes ---
-        let rowsA = transposeA ? K : M
-        let colsA = transposeA ? M : K
-        let rowsB = transposeB ? N : K
-        let colsB = transposeB ? K : N
-
-        // Calculate minimum required bytes based on logical dimensions
-        // Note: MPS might require buffer sizes aligned to certain boundaries depending on the hardware/kernel,
-        // but these basic checks catch obvious errors.
-        let requiredBytesA = M * K * bytesPerElement  // Size based on logical MxK before transpose
-        let requiredBytesB = K * N * bytesPerElement  // Size based on logical KxN before transpose
-        let requiredBytesC = M * N * bytesPerElement  // Size based on logical MxN
-
-        guard inputA.length >= requiredBytesA else {
-            print(
-                "Error [MatMulMPS]: inputA buffer too small. Has \(inputA.length), needs at least \(requiredBytesA) for \(M)x\(K)."
-            )
+        
+        // --- 1. Setup Arguments ---
+        var args = MetalRopeArgs()
+        
+        // Dimensions/Strides - CRITICAL: Match kernel expectations & buffer layout
+        args.ne0 = UInt32(headDim) // Elements processed per threadgroup in innermost dim?
+        args.n_dims = UInt32(config.ropeDimensionCount)
+        let bytesPerElement = UInt32(MemoryLayout<Float16>.size)
+        args.nb0 = bytesPerElement // Stride within headDim
+        args.nb1 = UInt32(headDim) * bytesPerElement // Stride to next head element
+        args.nb2 = UInt32(numHeads) * UInt32(headDim) * bytesPerElement // Stride to next sequence element
+        
+        // RoPE Params
+        args.freq_base = config.ropeFreqBase
+        args.freq_scale = 1.0 // TODO: Read from config if linear scaling is used instead/as well
+        args.p_type = 0 // Normal RoPE mode
+        
+        // Position
+        args.pos_offset = Int32(posOffset)
+        
+        // YaRN Parameters (NEW) - Read from config
+        // TODO: Add these to LlamaConfig if not already there
+        args.n_ctx_orig = Int32(config.sequenceLength) // Assuming sequenceLength is original ctx length for now
+        args.ext_factor = 0.0 // TODO: Read actual scaling factor (e.g., config.ropeScalingFactor) - may need adjustment if it's > 1.0
+        args.attn_factor = 1.0 // TODO: Read from config if needed (e.g., config.ropeAttnFactor)
+        args.beta_fast = 32.0 // TODO: Read from config (e.g., config.ropeBetaFast) - Using common defaults
+        args.beta_slow = 1.0  // TODO: Read from config (e.g., config.ropeBetaSlow) - Using common defaults
+        
+        guard let argsBuffer = device.makeBuffer(
+            bytes: &args,
+            length: MemoryLayout<MetalRopeArgs>.size,
+            options: .storageModeShared)
+        else {
+            print("Error [RoPE]: Failed to create args buffer.")
             return false
         }
-        guard inputB.length >= requiredBytesB else {
-            print(
-                "Error [MatMulMPS]: inputB buffer too small. Has \(inputB.length), needs at least \(requiredBytesB) for \(K)x\(N)."
-            )
-            return false
-        }
-        guard outputC.length >= requiredBytesC else {
-            print(
-                "Error [MatMulMPS]: outputC buffer too small. Has \(outputC.length), needs at least \(requiredBytesC) for \(M)x\(N)."
-            )
-            return false
-        }
-
-        // --- 2. Create MPSMatrixDescriptors ---
-        // Calculate rowBytes assuming tightly packed data. If your data had padding, adjust this.
-        // For A (MxK): K elements per row * bytes per element
-        let rowBytesA = K * bytesPerElement
-        // For B (KxN): N elements per row * bytes per element
-        let rowBytesB = N * bytesPerElement
-        // For C (MxN): N elements per row * bytes per element
-        let rowBytesC = N * bytesPerElement
-
-        // *** FIX: Remove guard let, create directly ***
-        let descA = MPSMatrixDescriptor(
-            rows: M, columns: K, rowBytes: rowBytesA, dataType: dataType)
-        let descB = MPSMatrixDescriptor(
-            rows: K, columns: N, rowBytes: rowBytesB, dataType: dataType)
-        let descC = MPSMatrixDescriptor(
-            rows: M, columns: N, rowBytes: rowBytesC, dataType: dataType)
-        // *** END FIX ***
-
-        // --- 3. Create MPSMatrix Objects ---
-        let matrixA = MPSMatrix(buffer: inputA, descriptor: descA)
-        let matrixB = MPSMatrix(buffer: inputB, descriptor: descB)
-        let matrixC = MPSMatrix(buffer: outputC, descriptor: descC)
-
-        // --- 4. Create MPSMatrixMultiplication Kernel ---
-        let mpsMatMulKernel = MPSMatrixMultiplication(
-            device: self.device,
-            transposeLeft: transposeA,
-            transposeRight: transposeB,
-            resultRows: M,
-            resultColumns: N,
-            interiorColumns: K,
-            alpha: 1.0,
-            beta: 0.0
-        )
-
-        // --- 5. Encode the Kernel ---
-        mpsMatMulKernel.encode(
-            commandBuffer: commandBuffer,
-            leftMatrix: matrixA,
-            rightMatrix: matrixB,
-            resultMatrix: matrixC
-        )
-
-        print(
-            "Successfully encoded MPS MatMul F16: (\(M)x\(K)) * (\(K)x\(N)) -> (\(M)x\(N)), tA=\(transposeA), tB=\(transposeB)"
-        )
+        
+        // --- 2. Encode ---
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+        encoder.label = "RoPE Kernel Encoder"
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(argsBuffer, offset: 0, index: 0)
+        encoder.setBuffer(buffer, offset: 0, index: 1)
+        encoder.setBuffer(ropeFrequencies, offset: 0, index: 2) // Pass optional buffer
+        
+        // --- 3. Dispatch ---
+        // CRITICAL: Grid/Group size must match kernel logic and buffer layout.
+        // Example dispatch strategy (assuming kernel processes pairs up to n_dims):
+        let elementsToRotatePerHeadSeq = config.ropeDimensionCount / 2 // Number of pairs
+        let threadsPerGroupWidth = min(pipeline.maxTotalThreadsPerThreadgroup, elementsToRotatePerHeadSeq) // How many pairs per group
+        let threadsPerGroup = MTLSize(width: threadsPerGroupWidth, height: 1, depth: 1)
+        
+        let numGroupsWidth = (elementsToRotatePerHeadSeq + threadsPerGroupWidth - 1) / threadsPerGroupWidth
+        let numGroupsHeight = numHeads // One group grid per head
+        let numGroupsDepth = sequenceLength // One group grid per sequence position
+        
+        let numThreadgroups = MTLSize(width: numGroupsWidth, height: numGroupsHeight, depth: numGroupsDepth)
+        
+        print("[RoPE Dispatch] Grid: \(numThreadgroups.width)x\(numThreadgroups.height)x\(numThreadgroups.depth), Group: \(threadsPerGroup.width)x\(threadsPerGroup.height)x\(threadsPerGroup.depth)")
+        encoder.dispatchThreadgroups(numThreadgroups, threadsPerThreadgroup: threadsPerGroup)
+        encoder.endEncoding()
+        print("Encoded RoPE kernel.")
         return true
     }
 }
