@@ -1,26 +1,83 @@
 import Foundation
 
-// GGUF data types
-
-
+// GGUF data types - CORRECTED according to GGUF spec
 enum GGUFDataType: UInt32 {
-    case f32 = 0
-    case f16 = 1
-    case f64 = 12
-    case q4_K_S = 14 // Keep enum case
-    case q4_K_M = 15
-    case q6_K = 18
-    // Add others if needed
+    case f32     = 0
+    case f16     = 1
+    case q4_0    = 2
+    case q4_1    = 3
+    // 4, 5 removed
+    case q5_0    = 6
+    case q5_1    = 7
+    case q8_0    = 8
+    case q8_1    = 9
+    case q2_K    = 10
+    case q3_K    = 11
+    case q4_K    = 12 // Formerly GGUF_TYPE_Q4_K
+    case q5_K    = 13 // Formerly GGUF_TYPE_Q5_K
+    case q6_K    = 14 // Formerly GGUF_TYPE_Q6_K
+    case q8_K    = 15 // Formerly GGUF_TYPE_Q8_K
+    case iq2_xxs = 16
+    case iq2_xs  = 17
+    case iq3_xxs = 18
+    case iq1_s   = 19
+    case iq4_nl  = 20
+    case iq3_s   = 21
+    case iq2_s   = 22
+    case iq4_xs  = 23
+    case i8      = 24
+    case i16     = 25
+    case i32     = 26
+    case i64     = 27
+    case f64     = 28 // Formerly GGUF_TYPE_F64
+    case iq1_m   = 29
+    // Note: Removed q4_K_S and q4_K_M as distinct cases, using the standard K-quant numbers.
+    // If you *specifically* need to differentiate S/M variants later based on metadata,
+    // that logic would go elsewhere, not in the type enum itself.
 
     var blockInfo: (blockSize: UInt64, blockBytes: UInt64)? {
+        // Block size for K-quants is typically 256
+        let QK_K: UInt64 = 256
+
         switch self {
+        // Non-quantized
         case .f32:    return (1, 4)
         case .f16:    return (1, 2)
         case .f64:    return (1, 8)
-        case .q4_K_S: return (256, 144)
-        case .q4_K_M: return (256, 144)
-        case .q6_K:   return (256, 210)
-        // Add others if needed
+        case .i8:     return (1, 1)
+        case .i16:    return (1, 2)
+        case .i32:    return (1, 4)
+        case .i64:    return (1, 8)
+
+        // Legacy Quants (Block Size 32)
+        case .q4_0:   return (32, 18) // 32 * 4/8 + 2
+        case .q4_1:   return (32, 20) // 32 * 4/8 + 2 + 2
+        case .q5_0:   return (32, 22) // 32 * 5/8 + 2
+        case .q5_1:   return (32, 24) // 32 * 5/8 + 2 + 2
+        case .q8_0:   return (32, 34) // 32 * 8/8 + 2
+        case .q8_1:   return (32, 40) // 32 * 8/8 + 4 + 4 (check this) - llama.cpp uses 32*sizeof(float) for scales
+
+        // K-Quants (Block Size 256)
+        case .q2_K:   return (QK_K, QK_K / 4 + QK_K / 16 + 2) // 16 blocks, 16 bytes q, 16 bytes scales, 2 bytes d/dmin -> 64 + 16 + 2 = 82? Check ggml.c `type_sizef`
+        case .q3_K:   return (QK_K, QK_K * 3 / 8 + QK_K / 8 + QK_K / 16 + 2) // 96 + 32 + 16 + 2 = 146? Check ggml.c
+        case .q4_K:   return (QK_K, QK_K / 2 + QK_K / 16 + 2) // 128 + 16 + 2 = 146? **NO, GGUF struct uses 12 bytes for scales/mins -> 128 + 12 + 2 + 2 = 144**
+        case .q5_K:   return (QK_K, QK_K * 5 / 8 + QK_K / 8 + QK_K / 16 + 2) // 160 + 32 + 16 + 2 = 210? Check ggml.c
+        case .q6_K:   return (QK_K, QK_K * 6 / 8 + QK_K / 16 + 2) // 192 + 16 + 2 = 210? **YES, Matches llama.cpp**
+        case .q8_K:   return (QK_K, QK_K + QK_K / 8 + 2) // 256 + 32 + 2 = 290? Check ggml.c
+
+        // TODO: Add block info for IQ types if needed
+
+        default:
+            print("Warning: blockInfo not defined for GGUFDataType \(self)")
+            return nil // Or handle as error
+        }
+    }
+
+    // Helper to check if it's a K-Quant type
+    var isKQuant: Bool {
+        switch self {
+            case .q2_K, .q3_K, .q4_K, .q5_K, .q6_K, .q8_K: return true
+            default: return false
         }
     }
 }

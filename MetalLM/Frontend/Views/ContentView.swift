@@ -1,26 +1,16 @@
 import SwiftUI
-import UniformTypeIdentifiers // For UTType
+import UniformTypeIdentifiers  // For UTType
 
 struct ContentView: View {
+    // Use the updated wrapper
     @StateObject private var modelLoaderWrapper = ModelLoaderWrapper()
 
-    @State private var isLoading: Bool = false
-    @State private var statusMessage: String = "Select a GGUF file to load."
-    @State private var dequantizedValues: [Float]? = nil
+    @State private var isLoading: Bool = false  // Keep for UI feedback
     @State private var selectedFileURL: URL? = nil
-
-    // Define tensors to test
-    let testCases: [(label: String, tensorName: String, expectedType: String)] = [
-        ("F32", "rope_freqs.weight", "f32"),
-        ("F64->F32", "token_embd.weight", "f64"),
-        ("Q4_K_S", "blk.0.ffn_down.weight", "q4_K_S") // Type 14
-        // Add more here later, e.g., find a Q4_K_M (15) or Q6_K (18) tensor if they exist
-        // ("Q4_K_M", "some_tensor_name", "q4_K_M") // Placeholder
-    ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
-            Text("MetaLLM Dequantization Test")
+            Text("MetaLLM Model Loader")
                 .font(.title)
                 .padding(.bottom, 5)
 
@@ -31,7 +21,14 @@ struct ContentView: View {
                 } label: {
                     Label("Select GGUF File...", systemImage: "folder.badge.plus")
                 }
-                Spacer() // Push button left
+                // Optional: Add button to clear/unload
+                Button("Clear") {
+                    selectedFileURL = nil
+                    modelLoaderWrapper.clearLoadedModel()
+                }
+                .disabled(selectedFileURL == nil && !modelLoaderWrapper.isMetadataLoaded)
+
+                Spacer()  // Push buttons left
             }
 
             if let url = selectedFileURL {
@@ -42,67 +39,73 @@ struct ContentView: View {
             }
             Divider()
 
-            // --- Test Buttons ---
-            Text("Run Tests:").font(.headline)
-            ScrollView(.horizontal, showsIndicators: false) { // Horizontal scroll for buttons
-                 HStack {
-                     ForEach(testCases, id: \.tensorName) { testCase in
-                         Button("Test \(testCase.label) (\(testCase.tensorName.split(separator: ".").last ?? ""))") {
-                             Task {
-                                 await loadAndDequantizeSpecific(
-                                     tensorName: testCase.tensorName,
-                                     expectedType: testCase.expectedType
-                                 )
-                             }
-                         }
-                         .disabled(selectedFileURL == nil || isLoading)
-                         .help("Test dequantization for \(testCase.tensorName) (Expected type: \(testCase.expectedType))")
-                     }
-                 }
-                 .padding(.vertical, 5)
+            // --- Load Button ---
+            Button {
+                Task {  // Run the async loading function
+                    await loadFullModel()
+                }
+            } label: {
+                Label("Load Full Model", systemImage: "memorychip")
             }
-
+            // Enable only if a file is selected AND metadata is loaded
+            .disabled(selectedFileURL == nil || !modelLoaderWrapper.isMetadataLoaded || isLoading)
+            .padding(.vertical)
 
             Divider()
 
-            // --- Status and Results ---
+            // --- Status and Model Info ---
             if isLoading {
-                ProgressView("Processing...")
-                    .padding(.vertical)
-            } else {
-                 Text(statusMessage)
-                    .foregroundColor(statusMessage.starts(with: "Error") ? .red : (statusMessage.starts(with: "Success") ? .green : .secondary))
-                    .font(.footnote)
-                    .lineLimit(4)
+                ProgressView("Loading Model...")  // More specific message
                     .padding(.vertical)
             }
 
-            if let values = dequantizedValues {
-                Text("Dequantized Values (First ~10):")
+            // Display status from the wrapper
+            Text(modelLoaderWrapper.currentStatus)
+                .font(.footnote)
+                .lineLimit(nil)  // Allow multiple lines
+                .fixedSize(horizontal: false, vertical: true)  // Prevent truncation
+                .padding(.vertical)
+                .foregroundColor(
+                    modelLoaderWrapper.currentStatus.lowercased().contains("error")
+                        ? .red
+                        : (modelLoaderWrapper.currentStatus.lowercased().contains("success")
+                            ? .green : .secondary))
+
+            // Optionally display loaded config details
+            if let config = modelLoaderWrapper.loadedModelConfig {
+                Divider()
+                Text("Loaded Model Config:")
                     .font(.headline)
-                ScrollView(.vertical) {
-                     VStack(alignment: .leading) {
-                         ForEach(0..<min(values.count, 10), id: \.self) { index in
-                            Text(String(format: "[%d]: %.6f", index, values[index]))
-                                .font(.system(.body, design: .monospaced))
-                        }
-                         if values.count > 10 {
-                             Text("...")
-                         }
-                     }
-                     .padding(.leading, 5)
+                // Use Text concatenation or formatting for multi-line display
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(
+                        String(
+                            format: "Layers: %d, Embed: %d, Hidden: %d", config.numLayers,
+                            config.embeddingDim, config.hiddenDim))
+                    Text(
+                        String(
+                            format: "Heads: %d, KV Heads: %d, Head Dim: %d", config.numHeads,
+                            config.numKeyValueHeads, config.headDim))
+                    Text(
+                        String(
+                            format: "Vocab: %d, Seq Len: %d", config.vocabSize,
+                            config.sequenceLength))
+                    Text(
+                        String(
+                            format: "RoPE Dim: %d, RoPE Freq Base: %.1f", config.ropeDimensionCount,
+                            config.ropeFreqBase))
                 }
-                .frame(maxHeight: 150)
-                .border(Color.gray.opacity(0.5)) // Add border for clarity
+                .font(.system(.caption, design: .monospaced))
             }
 
-            Spacer()
+            Spacer()  // Pushes content up
         }
         .padding()
-        .frame(minWidth: 500, minHeight: 450) // Slightly wider
+        .frame(minWidth: 500, minHeight: 350)  // Adjusted height
     }
 
-    // Function to handle file selection only (remains synchronous)
+    // Function to handle file selection
+    // Calls the wrapper to load metadata
     private func selectGGUFFile() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -112,293 +115,180 @@ struct ContentView: View {
 
         if panel.runModal() == .OK {
             if let url = panel.url {
-                selectedFileURL = url // Store the selected URL
-                statusMessage = "File selected. Ready to run tests."
-                dequantizedValues = nil // Clear previous results
+                selectedFileURL = url
+                // Trigger metadata loading in the wrapper asynchronously
+                Task {
+                    isLoading = true  // Show loading indicator for metadata load
+                    await modelLoaderWrapper.loadMetadata(url: url)
+                    isLoading = false  // Hide indicator after metadata load attempt
+                }
             } else {
-                statusMessage = "Error: Could not get URL for selected file."
-                selectedFileURL = nil
+                // Handle error getting URL (rare)
+                Task { @MainActor in  // Ensure UI update is on main thread
+                    selectedFileURL = nil
+                    modelLoaderWrapper.currentStatus = "Error: Could not get URL for selected file."
+                }
             }
         } else {
-            // User cancelled
-            statusMessage = "File selection cancelled."
-        }
-    }
-
-
-    // Function to handle loading and dequantizing - NOW ASYNC
-    @MainActor // Ensure UI updates happen on main thread after await
-    private func loadAndDequantize() async { // Mark function as async
-        guard let urlToLoad = selectedFileURL else {
-            statusMessage = "Error: No file selected to load."
-            return
-        }
-
-        // Update UI state before starting background work
-        isLoading = true
-        statusMessage = "Loading GGUF metadata..."
-        dequantizedValues = nil
-
-        var finalMessage: String
-        var finalValues: [Float]? = nil
-
-        // Perform potentially long-running tasks in a non-main actor context
-        // Use Task.detached or Task { await Task.yield() } if needed, but often
-        // the awaits below handle switching away from main thread implicitly.
-        // For clarity, we can use Task.detached or a Task running on a global executor.
-        // However, since ModelLoader methods might switch threads internally (e.g., Metal),
-        // we just need to ensure calls TO the @MainActor wrapper are done correctly.
-
-        // We'll call the wrapper's methods which are @MainActor isolated.
-        // Swift concurrency handles the context switching.
-        do {
-            // Step 1: Load the model metadata (calls @MainActor func)
-            try await modelLoaderWrapper.loadModel(url: urlToLoad)
-            // UI updates are safe here because we are effectively back on MainActor after await
-            finalMessage = "Model loaded. Dequantizing first tensor..."
-            statusMessage = finalMessage // Update status message
-
-            // Step 2: Dequantize the first tensor (calls @MainActor func)
-            finalValues = try await modelLoaderWrapper.dequantizeFirstTensor()
-            finalMessage = modelLoaderWrapper.currentStatus // Read status (safe on MainActor)
-
-        } catch let error as ModelLoaderError {
-             // Handle specific ModelLoader errors
-             switch error {
-             case .modelNotLoaded: finalMessage = "Error: Model wasn't loaded before dequantization."
-             case .tensorNotFound(let name): finalMessage = "Error: Tensor '\(name)' not found."
-             case .failedToGetTensorData(let name): finalMessage = "Error: Couldn't get data for tensor '\(name)'."
-             case .failedToCreateMetalBuffer(let name): finalMessage = "Error: Couldn't create Metal buffer for '\(name)'."
-             case .dequantizationFailed(let name, let underlyingError):
-                  finalMessage = "Error: Dequantization failed for '\(name)'."
-                  if let underlyingError = underlyingError {
-                      finalMessage += " (\(underlyingError.localizedDescription))"
-                  }
-             case .unsupportedTensorType(let name, let type): finalMessage = "Error: Unsupported tensor type '\(type)' for tensor '\(name)'."
-             // Removed default case as ModelLoaderError is frozen or non-frozen enum handling is exhaustive
-             case .metalServiceUnavailable: finalMessage = "Error: Metal service is unavailable."
-             }
-             print("Caught ModelLoaderError: \(finalMessage)") // Log details
-        } catch let error as GGUFError {
-             // Handle specific GGUF parsing errors from loadModel
-             finalMessage = "Error parsing GGUF file: \(error)" // Customize based on GGUFError cases
-             print("Caught GGUFError: \(finalMessage)")
-        } catch {
-             // Handle any other unexpected errors
-             finalMessage = "An unexpected error occurred: \(error.localizedDescription)"
-             print("Caught unexpected error: \(finalMessage)")
-        }
-
-        // Final UI updates (already on MainActor)
-        statusMessage = finalMessage
-        dequantizedValues = finalValues
-        isLoading = false
-    }
-
-    // Updated async function
-    @MainActor
-    private func loadAndDequantizeSpecific(tensorName: String, expectedType: String) async {
-        guard let urlToLoad = selectedFileURL else {
-            statusMessage = "Error: No file selected to load."
-            return
-        }
-
-        isLoading = true
-        statusMessage = "Loading GGUF metadata for \(urlToLoad.lastPathComponent)..."
-        dequantizedValues = nil // Clear previous results
-
-        var finalMessage: String
-        var finalValues: [Float]? = nil
-
-        do {
-            // Step 1: Load model metadata (clears cache internally)
-            try await modelLoaderWrapper.loadModel(url: urlToLoad)
-            statusMessage = "Model loaded. Attempting to dequantize '\(tensorName)' (Expected: \(expectedType))..."
-
-            // Step 2: Dequantize the SPECIFIC tensor
-            finalValues = try await modelLoaderWrapper.dequantizeTensorByName(name: tensorName)
-            // Use status from wrapper if it's detailed, otherwise craft success message
-            // finalMessage = modelLoaderWrapper.currentStatus
-            finalMessage = "Success: Dequantized '\(tensorName)'. First 10 values displayed."
-
-
-        } catch let error as ModelLoaderError {
-            switch error {
-            case .tensorNotFound(let name): finalMessage = "Error: Tensor '\(name)' not found."
-            case .unsupportedTensorType(let name, let type): finalMessage = "Error: Dequantization for type '\(type)' (Tensor: '\(name)') is not supported."
-            case .dequantizationFailed(let name, let underlying): finalMessage = "Error: Dequantization failed for '\(name)'" + (underlying == nil ? "." : " (\(underlying!))")
-            default: finalMessage = "ModelLoaderError: \(error)" // Catch-all for other loader errors
+            // User cancelled - update status gently
+            Task { @MainActor in
+                // Only update status if no file was previously selected
+                if selectedFileURL == nil {
+                    modelLoaderWrapper.currentStatus = "File selection cancelled."
+                }
             }
-             print("Caught ModelLoaderError: \(finalMessage)")
-        } catch let error as GGUFError {
-             finalMessage = "GGUFError loading/parsing file: \(error)"
-             print("Caught GGUFError: \(finalMessage)")
-        } catch {
-             finalMessage = "An unexpected error occurred: \(error)"
-             print("Caught unexpected error: \(finalMessage)")
+        }
+    }
+
+    // Function to trigger full model loading
+    @MainActor
+    private func loadFullModel() async {
+        guard let urlToLoad = selectedFileURL else {
+            // This should be prevented by button disable state, but safety check
+            modelLoaderWrapper.currentStatus = "Error: No file selected to load."
+            return
         }
 
-        // Final UI updates
-        statusMessage = finalMessage
-        dequantizedValues = finalValues
-        isLoading = false
+        isLoading = true  // Show loading indicator
+
+        // Call the wrapper's assembly function
+        await modelLoaderWrapper.assembleFullModel(url: urlToLoad)
+
+        isLoading = false  // Hide loading indicator
     }
 }
 
 // Wrapper class to hold onto our services and model data
-@MainActor // Ensures changes/accesses happen on main thread
+@MainActor  // Ensures changes/accesses happen on main thread
 class ModelLoaderWrapper: ObservableObject {
 
     private var metalService: MetalService?
     private var modelLoader: ModelLoader?
 
+    // State properties
     @Published var currentStatus: String = "Not loaded"
+    @Published var isMetadataLoaded: Bool = false  // Track if metadata is ready
+    @Published var loadedModelConfig: LlamaConfig? = nil  // Store config after loading
+
+    // Store the fully loaded model (optional for now)
+    private var llamaModel: LlamaModel?
 
     init() {
         self.metalService = MetalService.shared
         if self.metalService == nil {
-             currentStatus = "Error: Metal initialization failed!"
+            currentStatus = "Error: Metal initialization failed!"
+            isMetadataLoaded = false
         } else {
-             currentStatus = "Metal Service Ready."
+            // Initialize ModelLoader here
+            self.modelLoader = ModelLoader(metalService: metalService!)
+            currentStatus = "Metal Service Ready. Select a GGUF file."
+            isMetadataLoaded = false
         }
     }
 
-    /// Loads the model using ModelLoader instance. Now async.
-    func loadModel(url: URL) async throws { // Mark as async
-        guard let metal = self.metalService else {
-             currentStatus = "Error: Metal Service not available."
-             throw ModelLoaderError.metalServiceUnavailable
-        }
-
-        print("Loading model from: \(url.path)")
-        if self.modelLoader == nil {
-             self.modelLoader = ModelLoader(metalService: metal)
-        } else {
-             // If modelLoader exists, ensure caches are cleared for a potentially new file
-             self.modelLoader?.clearCaches()
-        }
-
-        // Perform file loading potentially off the main thread if GGUFFile init is heavy
-        // For now, assume GGUFFile init is acceptable on main actor or handles its own async
-        try self.modelLoader?.loadModel(url: url) // This call is now safe
-
-        currentStatus = "Model loaded: \(url.lastPathComponent)"
-        print("GGUF metadata loaded successfully.")
-    }
-
-    /// Dequantizes the first tensor. Now async.
-    func dequantizeFirstTensor() async throws -> [Float]? { // Mark as async
+    /// Loads *only* the metadata from the GGUF file.
+    func loadMetadata(url: URL) async {
         guard let loader = self.modelLoader else {
-            currentStatus = "Error: No model loaded."
-            throw ModelLoaderError.modelNotLoaded
-        }
-        guard let firstTensorDesc = loader.ggufFile?.tensors.first else {
-             currentStatus = "Error: Model contains no tensors."
-             throw ModelLoaderError.tensorNotFound("N/A - No tensors found")
-        }
-        let firstTensorName = firstTensorDesc.name
-
-        print("Attempting to dequantize tensor: \(firstTensorName)")
-        currentStatus = "Dequantizing \(firstTensorName)..."
-
-        // Perform the potentially long-running dequantization off the main thread
-        // ModelLoader.dequantizeTensor itself might use background threads (e.g., Metal completion)
-        // but the initial call needs to be managed.
-        // We can make ModelLoader.dequantizeTensor async or wrap the call here.
-        // Let's assume ModelLoader.dequantizeTensor can be called and might block
-        // or use its own async pattern. For safety, wrap in Task.
-
-        // *** Option 1: Make ModelLoader.dequantizeTensor async (Preferred) ***
-        // If ModelLoader.dequantizeTensor is marked async:
-        // let dequantizedBuffer = try await loader.dequantizeTensor(tensorName: firstTensorName, outputType: .f32)
-
-        // *** Option 2: Wrap synchronous ModelLoader.dequantizeTensor in Task ***
-        let dequantizedBuffer = try await Task { // Run potentially blocking work in background Task
-             try loader.dequantizeTensor(tensorName: firstTensorName, outputType: .f32)
-        }.value // Get the result back
-
-
-        print("Tensor dequantized successfully. Reading back values...")
-        currentStatus = "Reading back values for \(firstTensorName)..."
-
-        let elementCount = Int(firstTensorDesc.elementCount)
-        let valuesToRead = min(elementCount, 10)
-
-        guard valuesToRead > 0 else {
-             currentStatus = "Tensor '\(firstTensorName)' dequantized (0 elements)."
-             return []
-        }
-        guard dequantizedBuffer.length >= valuesToRead * MemoryLayout<Float>.size else {
-             currentStatus = "Error: Dequantized buffer size (\(dequantizedBuffer.length)) is too small for \(valuesToRead) floats."
-             throw ModelLoaderError.dequantizationFailed(firstTensorName, nil)
+            currentStatus = "Error: ModelLoader not initialized."
+            isMetadataLoaded = false
+            return
         }
 
-        // Reading buffer contents might be okay on main actor if quick,
-        // but could also be done in the background task if needed.
-        let pointer = dequantizedBuffer.contents().bindMemory(to: Float.self, capacity: valuesToRead)
-        let values = Array(UnsafeBufferPointer(start: pointer, count: valuesToRead))
+        print("Wrapper: Attempting to load metadata from \(url.path)")
+        currentStatus = "Loading metadata..."
+        isMetadataLoaded = false
+        loadedModelConfig = nil
+        llamaModel = nil  // Clear any previously loaded model
 
-        currentStatus = "Successfully dequantized '\(firstTensorName)'."
-        return values
+        do {
+            // Use Task to ensure loadMetadata runs off the main thread if it becomes heavy
+            try await Task { try loader.loadMetadata(url: url) }.value
+            currentStatus =
+                "Metadata loaded for \(url.lastPathComponent). Ready to load full model."
+            isMetadataLoaded = true
+            // Optionally, extract and publish config immediately after metadata load
+            // if LlamaConfig init doesn't throw often and is fast
+            if let metadata = loader.ggufFile?.metadata {
+                do {
+                    self.loadedModelConfig = try LlamaConfig(metadata: metadata)
+                    currentStatus += "\nConfig parsed."
+                } catch {
+                    currentStatus =
+                        "Metadata loaded, but failed to parse config: \(error.localizedDescription)"
+                    isMetadataLoaded = false  // Treat as not fully ready if config fails
+                }
+            }
+
+        } catch let error as GGUFError {
+            currentStatus = "Error loading metadata (GGUF): \(error)"
+            isMetadataLoaded = false
+        } catch {
+            currentStatus = "Error loading metadata: \(error.localizedDescription)"
+            isMetadataLoaded = false
+        }
+        print("Wrapper: Metadata loading complete. Status: \(currentStatus)")
     }
 
-    /// Dequantizes a tensor by the specified name. Now async.
-    func dequantizeTensorByName(name tensorName: String) async throws -> [Float]? { // Renamed and added parameter
+    /// Loads the full model structure and tensors. Requires metadata to be loaded first.
+    func assembleFullModel(url: URL) async {
         guard let loader = self.modelLoader else {
-            currentStatus = "Error: No model loaded."
-            throw ModelLoaderError.modelNotLoaded
+            currentStatus = "Error: ModelLoader not initialized."
+            return
         }
-        // Find the tensor descriptor (optional, but good for getting element count)
-        guard let tensorDesc = loader.getTensorDescriptor(name: tensorName) else {
-            currentStatus = "Error: Tensor '\(tensorName)' not found in loaded model."
-            throw ModelLoaderError.tensorNotFound(tensorName)
+        guard isMetadataLoaded else {
+            currentStatus = "Error: Metadata must be loaded before assembling the full model."
+            return
+        }
+        // Ensure the URL passed matches the one metadata was loaded from (optional sanity check)
+        guard url == loader.ggufFile?.url else {
+            currentStatus =
+                "Error: Attempting to load full model from a different URL (\(url.lastPathComponent)) than the loaded metadata (\(loader.ggufFile?.url.lastPathComponent ?? "None")). Please re-select the file."
+            isMetadataLoaded = false  // Require re-selection
+            return
         }
 
-        print("Attempting to dequantize tensor: \(tensorName) (Type: \(tensorDesc.type))")
-        currentStatus = "Dequantizing \(tensorName)..."
+        print("Wrapper: Attempting to assemble full model from \(url.path)")
+        currentStatus = "Loading full model tensors..."
+        llamaModel = nil  // Clear previous model instance
 
-        // Dequantize the specified tensor to F32
-        let dequantizedBuffer = try await Task { // Run potentially blocking work in background Task
-            try loader.dequantizeTensor(tensorName: tensorName, outputType: .f32)
-        }.value
+        do {
+            // Call the main loading function in ModelLoader
+            let loadedModel = try await loader.loadLlamaModel(
+                url: url,
+                computePrecision: .f16,  // Keep compute as f16
+                normWeightType: .f32,  // Keep norms as f32
+                embeddingType: .f32  // Request F32 for embeddings
+            )
 
-        print("Tensor dequantized successfully. Reading back values...")
-        currentStatus = "Reading back values for \(tensorName)..."
+            // Store the loaded model
+            self.llamaModel = loadedModel
+            self.loadedModelConfig = loadedModel.config  // Ensure config is updated
 
-        let elementCount = Int(tensorDesc.elementCount) // Use descriptor for count
-        let valuesToRead = min(elementCount, 10) // Read first 10 again
+            currentStatus = "Success: Full model '\(url.lastPathComponent)' loaded and assembled!"  // This message might change if Q6_K fails
+            print("Wrapper: Full model assembly complete.")
 
-        guard valuesToRead > 0 else {
-            currentStatus = "Tensor '\(tensorName)' dequantized (0 elements)."
-            return []
+        } catch let error as ModelLoaderError {
+            currentStatus = "Error assembling model: \(error)"  // More specific error from ModelLoader
+            print("Caught ModelLoaderError during assembly: \(error)")
+        } catch let error as ConfigError {
+            currentStatus = "Error reading config during assembly: \(error)"
+            print("Caught ConfigError during assembly: \(error)")
+        } catch {
+            currentStatus = "Unexpected error assembling model: \(error.localizedDescription)"
+            print("Caught unexpected error during assembly: \(error)")
         }
-        let expectedBufferSize = valuesToRead * MemoryLayout<Float>.size
-        guard dequantizedBuffer.length >= expectedBufferSize else {
-             currentStatus = "Error: Dequantized buffer size (\(dequantizedBuffer.length)) is too small for \(valuesToRead) floats (expected at least \(expectedBufferSize))."
-             // It's possible elementCount was wrong, or dequantization failed silently.
-             // Let's try reading what we can, up to buffer length.
-             let actualFloatsReadable = dequantizedBuffer.length / MemoryLayout<Float>.size
-             if actualFloatsReadable == 0 {
-                 print("Buffer length \(dequantizedBuffer.length) is less than one float.")
-                 throw ModelLoaderError.dequantizationFailed(tensorName, nil)
-             }
-             print("Warning: Buffer size mismatch. Reading only \(actualFloatsReadable) floats.")
-             let pointer = dequantizedBuffer.contents().bindMemory(to: Float.self, capacity: actualFloatsReadable)
-             let values = Array(UnsafeBufferPointer(start: pointer, count: actualFloatsReadable))
-             currentStatus = "Successfully dequantized '\(tensorName)' (Warning: Buffer size mismatch)."
-             return values
-         }
+    }
 
-        // Reading buffer contents
-        let pointer = dequantizedBuffer.contents().bindMemory(to: Float.self, capacity: valuesToRead)
-        let values = Array(UnsafeBufferPointer(start: pointer, count: valuesToRead))
-
-        currentStatus = "Successfully dequantized '\(tensorName)'."
-        return values
+    // Optional: Function to clear the loaded model
+    func clearLoadedModel() {
+        llamaModel = nil
+        loadedModelConfig = nil
+        isMetadataLoaded = false
+        currentStatus = "Model unloaded. Select a GGUF file."
+        modelLoader?.unloadModel()  // Also clear caches in ModelLoader
+        print("Wrapper: Cleared loaded model.")
     }
 }
-
-// Ensure other supporting files (GGUFFile, ModelLoader, MetalService) are correct
 
 #Preview {
     ContentView()
