@@ -124,17 +124,23 @@ static void calculate_rope_yarn(
 //------------------------------------------------------------------------------
 // RoPE Kernel (Float16, In-Place, Normal Mode)
 //------------------------------------------------------------------------------
+// In PositionalEmbeddingKernels.metal
+
+// ... (Keep includes, MetalRopeArgs, Helper Functions) ...
+
+//------------------------------------------------------------------------------
+// RoPE Kernel (Float16, In-Place, Normal Mode)
+//------------------------------------------------------------------------------
 kernel void kernel_rope_f16_inplace(
     constant MetalRopeArgs   & args  [[buffer(0)]],
     device   half            * data  [[buffer(1)]], // Input/Output Q or K
     device const float       * freqs [[buffer(2)]], // Optional freq factors
-    // Grid/Thread IDs
-    uint3 tid [[thread_position_in_grid]], // Assume grid maps directly: [dim_pair_idx, head_idx, seq_idx]
-    uint3 gid [[group_position_in_grid]],  // Not typically needed if using tid directly
-    uint3 gdim [[grid_dimensions]]         // Grid dimensions [n_dims/2, num_heads, seq_len]
+    // --- REVERTED Grid/Thread IDs ---
+    uint3 tid  [[thread_position_in_grid]], // Use vector for position
+    uint3 gdim [[threads_per_grid]]         // Keep grid dimensions
 ) {
 
-    // Map thread ID to dimensions
+    // Map thread ID vector components to dimensions
     uint dim_pair_idx = tid.x; // Index for the pair of dimensions (0 to n_dims/2 - 1)
     uint head_idx     = tid.y; // Head index (0 to num_heads - 1)
     uint seq_idx      = tid.z; // Sequence index (0 to seq_len - 1)
@@ -152,61 +158,45 @@ kernel void kernel_rope_f16_inplace(
 
     // --- Calculate Theta ---
     float theta_base = float(current_pos);
-    // Use float for intermediate calculations for precision
     float inv_ndims = -1.0f / float(args.n_dims);
     float theta_extrap = theta_base * pow(args.freq_base, inv_ndims * float(i0));
 
     // --- Get Frequency Factor ---
-    // Index into the freqs buffer (if provided) corresponds to the dimension pair index
     uint ic = dim_pair_idx;
-    // Use the flag from args to check if the buffer is valid and should be used
     float freq_factor = args.has_freq_factors ? freqs[ic] : 1.0f;
-    // Avoid division by zero
     float theta_scaled = theta_extrap / max(0.0001f, freq_factor);
 
     // --- Calculate Sin/Cos using YaRN logic ---
     float cos_theta;
     float sin_theta;
-
-    // Pre-calculate YaRN correction dimensions (potentially on CPU is better)
-    // Here we calculate it per-thread, which might be slightly redundant
-    // but matches the reference kernel structure.
     float corr_dims[2];
-    rope_yarn_corr_dims(
-        args.n_dims, args.n_ctx_orig, args.freq_base,
-        args.beta_fast, args.beta_slow, corr_dims
-    );
-
-    calculate_rope_yarn(
-        theta_scaled,     // Base theta adjusted by freq_factor
-        args.freq_scale,  // Linear scaling
-        corr_dims,        // Pass calculated correction dims
-        i0,               // Dimension index
-        args.ext_factor,  // YaRN extrapolation factor
-        args.attn_factor, // Base magnitude scale
-        cos_theta,        // Output cos
-        sin_theta         // Output sin
-    );
+    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    calculate_rope_yarn(theta_scaled, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor, cos_theta, sin_theta);
 
     // --- Apply Rotation ---
-    // Calculate the offset into the 'data' buffer based on layout.
     // Assuming layout [SequenceLength, NumHeads, HeadDim]
-    uint num_heads = gdim.y; // Get numHeads from grid dimension
-    uint head_dim = gdim.x * 2; // Get headDim from grid dimension (pairs * 2)
-    uint base_offset = seq_idx * (num_heads * head_dim) // Offset to start of sequence element
-                     + head_idx * head_dim            // Offset to start of head within sequence element
-                     + i0;                            // Offset to the start of the pair within head
+    // Get dimensions from grid (passed by host)
+    uint num_heads = gdim.y;
+    uint head_dim = gdim.x * 2; // width of grid is n_dims/2
 
-    // Check calculated offset against buffer length (optional safety)
-    // uint buffer_elements = buffer_length / sizeof(half);
-    // if (base_offset + 1 >= buffer_elements) return; // Out of bounds
+    // Calculate offset using the indices derived from tid components
+    uint base_offset = seq_idx * (num_heads * head_dim)
+                     + head_idx * head_dim
+                     + i0;
 
     device half * element_pair_ptr = data + base_offset;
 
-    half x0 = element_pair_ptr[0];
-    half x1 = element_pair_ptr[1]; // Assumes pair is adjacent
+    // Bounds check before accessing memory (more robust)
+    // Calculate the total number of elements in the buffer
+    // uint total_elements = gdim.x * 2 * gdim.y * gdim.z; // Or get buffer length / sizeof(half)
+    // if (base_offset + 1 >= total_elements) { // Ensure accessing pair is safe
+    //     // Handle error or return - this depends on how buffer size vs grid size is managed
+    //     return;
+    // }
 
-    // Apply rotation using half precision
+    half x0 = element_pair_ptr[0];
+    half x1 = element_pair_ptr[1];
+
     element_pair_ptr[0] = x0 * half(cos_theta) - x1 * half(sin_theta);
     element_pair_ptr[1] = x0 * half(sin_theta) + x1 * half(cos_theta);
 }

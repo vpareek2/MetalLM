@@ -9,50 +9,75 @@ enum ConfigError: Error {
     case missingMetadata(key: String)
     case invalidMetadataType(key: String, expected: String)
     case configurationError(message: String)
+    case unknownRopeScalingType(String)  // Added for RoPE
 }
 
 // MARK: - Llama Configuration
+
+// Add enum for RoPE Scaling Type
+enum RopeScalingType: String {
+    case none = "none"
+    case linear = "linear"
+    case yarn = "yarn"
+}
 
 /// Holds the hyperparameters and architectural details of a Llama model,
 /// typically loaded from GGUF metadata.
 struct LlamaConfig {
     // Core Dimensions
-    let embeddingDim: Int  // n_embd: Dimension of token embeddings
-    let hiddenDim: Int  // n_ff: Dimension of the intermediate layer in MLP/FFN
-    let headDim: Int  // n_head_dim: Dimension of each attention head (calculated)
-    let numLayers: Int  // n_layer: Number of transformer blocks
-    let numHeads: Int  // n_head: Number of attention heads
-    let numKeyValueHeads: Int  // n_kv_head: Number of key/value heads (for GQA/MQA)
+    let embeddingDim: Int
+    let hiddenDim: Int
+    let headDim: Int
+    let numLayers: Int
+    let numHeads: Int
+    let numKeyValueHeads: Int
 
     // Vocabulary & Context
-    let vocabSize: Int  // Vocabulary size
-    let sequenceLength: Int  // n_ctx: Maximum sequence length the model supports
+    let vocabSize: Int
+    let sequenceLength: Int  // Max context length
 
     // Normalization
-    let rmsNormEps: Float  // Epsilon value for RMSNorm layers
+    let rmsNormEps: Float
 
-    // RoPE (Rotary Positional Embedding) Parameters - TODO: Verify GGUF keys
-    let ropeDimensionCount: Int  // Defaults to headDim if not specified? Check GGUF keys like llama.rope.dimension_count
-    let ropeFreqBase: Float  // Typically 10000.0 or 500000.0 etc. Check GGUF keys like llama.rope.freq_base
+    // --- RoPE ---
+    let ropeDimensionCount: Int
+    let ropeFreqBase: Float
+    // Scaling Parameters (Including YaRN)
+    let ropeScalingType: RopeScalingType  // Type of scaling used
+    let ropeScalingFactor: Float  // General scaling factor (used by linear/yarn)
+    let ropeScalingOrigContextLength: Int  // Original context length for scaling calculations
+    let ropeScalingFinetuned: Bool  // Whether the model was finetuned with scaling
+    // YaRN Specific (often derived or have defaults)
+    let ropeScalingBetaFast: Float  // YaRN param
+    let ropeScalingBetaSlow: Float  // YaRN param
+    // --- End RoPE ---
 
     // Calculated properties
-    var numQueryGroups: Int { numHeads / numKeyValueHeads }  // For GQA/MQA grouping
+    var numQueryGroups: Int { numHeads / numKeyValueHeads }
 
     /// Initializes the configuration by parsing metadata from a GGUF file.
-    /// - Parameter metadata: A dictionary containing key-value pairs from GGUF metadata.
-    /// - Throws: `ConfigError` if required metadata is missing or has an incorrect type.
     init(metadata: [String: GGUFValue]) throws {
-        // Helper functions for safe metadata extraction
+        // --- Helper Functions ---
         func getRequiredUInt64(_ key: String) throws -> UInt64 {
             guard let value = metadata[key]?.uint64 else {
                 throw ConfigError.missingMetadata(key: key)
             }
             return value
         }
-
+        func getOptionalUInt64(_ key: String, default defaultValue: UInt64) -> UInt64 {
+            return metadata[key]?.uint64 ?? defaultValue
+        }
+        func getRequiredUInt32(_ key: String) throws -> UInt32 {
+            guard let value = metadata[key]?.uint32 else {
+                throw ConfigError.missingMetadata(key: key)
+            }
+            return value
+        }
+        func getOptionalUInt32(_ key: String, default defaultValue: UInt32) -> UInt32 {
+            return metadata[key]?.uint32 ?? defaultValue
+        }
         func getRequiredFloat32(_ key: String) throws -> Float {
             guard case .float32(let value) = metadata[key] else {
-                // Attempt fallback for uint32/uint64 if necessary? For now, require float32.
                 throw ConfigError.invalidMetadataType(key: key, expected: "Float32")
             }
             return value
@@ -63,8 +88,18 @@ struct LlamaConfig {
             }
             return value
         }
+        func getOptionalString(_ key: String, default defaultValue: String) -> String {
+            return metadata[key]?.string ?? defaultValue
+        }
+        func getOptionalBool(_ key: String, default defaultValue: Bool) -> Bool {
+            guard case .bool(let value) = metadata[key] else {
+                return defaultValue
+            }
+            return value
+        }
+        // --- End Helper Functions ---
 
-        // Extract required values
+        // --- Extract Core Dimensions ---
         self.embeddingDim = Int(try getRequiredUInt64("llama.embedding_length"))
         self.numLayers = Int(try getRequiredUInt64("llama.block_count"))
         self.numHeads = Int(try getRequiredUInt64("llama.attention.head_count"))
@@ -74,13 +109,33 @@ struct LlamaConfig {
         self.sequenceLength = Int(try getRequiredUInt64("llama.context_length"))
         self.rmsNormEps = try getRequiredFloat32("llama.attention.layer_norm_rms_epsilon")
 
-        // --- RoPE Parameters ---
-        // Use defaults or throw if missing, depending on strictness required.
-        // Need to confirm the exact GGUF keys used by the models you target.
-        // Example potential keys:
+        // --- Extract RoPE Parameters ---
+        let defaultRopeDim = embeddingDim / numHeads  // Default RoPE dim = head dim
         self.ropeDimensionCount = Int(
-            metadata["llama.rope.dimension_count"]?.uint64 ?? UInt64(embeddingDim / numHeads))  // Often defaults to head dimension
-        self.ropeFreqBase = getOptionalFloat32("llama.rope.freq_base", default: 500000.0)  // Default updated based on dump
+            getOptionalUInt64("llama.rope.dimension_count", default: UInt64(defaultRopeDim)))
+        // Your GGUF dump showed 500k, let's keep that as default maybe? Or 10k? Check common Llama3 base.
+        self.ropeFreqBase = getOptionalFloat32("llama.rope.freq_base", default: 500000.0)
+
+        // --- Extract RoPE Scaling/YaRN Parameters ---
+        let scalingTypeString = getOptionalString("llama.rope.scaling.type", default: "none")
+        guard let scalingType = RopeScalingType(rawValue: scalingTypeString.lowercased()) else {
+            throw ConfigError.unknownRopeScalingType(scalingTypeString)
+        }
+        self.ropeScalingType = scalingType
+
+        // Factor applies to linear and yarn
+        self.ropeScalingFactor = getOptionalFloat32("llama.rope.scaling.factor", default: 1.0)
+
+        // Original context length - use current sequenceLength as default if missing
+        self.ropeScalingOrigContextLength = Int(
+            getOptionalUInt32(
+                "llama.rope.scaling.original_context_length", default: UInt32(self.sequenceLength)))
+
+        self.ropeScalingFinetuned = getOptionalBool("llama.rope.scaling.finetuned", default: false)
+
+        // YaRN betas - use common defaults if missing (check llama.cpp defaults if unsure)
+        self.ropeScalingBetaFast = getOptionalFloat32("llama.rope.scaling.beta_fast", default: 32.0)
+        self.ropeScalingBetaSlow = getOptionalFloat32("llama.rope.scaling.beta_slow", default: 1.0)
 
         // --- Validations and Derived Values ---
         guard embeddingDim % numHeads == 0 else {
@@ -98,7 +153,7 @@ struct LlamaConfig {
             )
         }
 
-        // Print loaded config for verification during development
+        // --- Print Loaded Config ---
         print("--- LlamaConfig Initialized ---")
         print(
             String(
@@ -115,6 +170,15 @@ struct LlamaConfig {
         print(
             String(format: "  RoPE Dim: %d, RoPE Freq Base: %.1f", ropeDimensionCount, ropeFreqBase)
         )
+        print(
+            String(
+                format: "  RoPE Scaling: Type=%@, Factor=%.2f, OrigCtx=%d, Tuned=%@",
+                ropeScalingType.rawValue, ropeScalingFactor, ropeScalingOrigContextLength,
+                String(describing: ropeScalingFinetuned)))
+        print(
+            String(
+                format: "  RoPE YaRN: BetaFast=%.1f, BetaSlow=%.1f", ropeScalingBetaFast,
+                ropeScalingBetaSlow))
         print("-----------------------------")
     }
 }
