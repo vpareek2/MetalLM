@@ -1,10 +1,13 @@
+import Metal  // Needed for MTLBuffer in test function
+import MetalKit  // Potentially useful for test data generation
 import SwiftUI
 import UniformTypeIdentifiers  // For UTType
 
 struct ContentView: View {
     // Use the updated wrapper
-    @StateObject private var modelLoaderWrapper = ModelLoaderWrapper()
+    @StateObject private var modelLoaderWrapper = ModelLoaderWrapper()  // Error occurs here if class isn't defined yet
 
+    // ... (Rest of ContentView struct code as provided in the previous correct version) ...
     @State private var isLoading: Bool = false  // Keep for UI feedback
     @State private var selectedFileURL: URL? = nil
 
@@ -21,14 +24,12 @@ struct ContentView: View {
                 } label: {
                     Label("Select GGUF File...", systemImage: "folder.badge.plus")
                 }
-                // Optional: Add button to clear/unload
                 Button("Clear") {
                     selectedFileURL = nil
                     modelLoaderWrapper.clearLoadedModel()
                 }
                 .disabled(selectedFileURL == nil && !modelLoaderWrapper.isMetadataLoaded)
-
-                Spacer()  // Push buttons left
+                Spacer()
             }
 
             if let url = selectedFileURL {
@@ -41,13 +42,12 @@ struct ContentView: View {
 
             // --- Load Button ---
             Button {
-                Task {  // Run the async loading function
-                    await loadFullModel()
+                Task {
+                    await loadFullModelAndTestRope()  // Modified action
                 }
             } label: {
-                Label("Load Full Model", systemImage: "memorychip")
+                Label("Load Full Model & Test RoPE", systemImage: "memorychip")  // Updated label
             }
-            // Enable only if a file is selected AND metadata is loaded
             .disabled(selectedFileURL == nil || !modelLoaderWrapper.isMetadataLoaded || isLoading)
             .padding(.vertical)
 
@@ -55,28 +55,29 @@ struct ContentView: View {
 
             // --- Status and Model Info ---
             if isLoading {
-                ProgressView("Loading Model...")  // More specific message
-                    .padding(.vertical)
+                ProgressView(
+                    modelLoaderWrapper.currentStatus.contains("Loading full model")
+                        ? "Loading Model..." : "Processing..."
+                )
+                .padding(.vertical)
             }
 
-            // Display status from the wrapper
             Text(modelLoaderWrapper.currentStatus)
                 .font(.footnote)
-                .lineLimit(nil)  // Allow multiple lines
-                .fixedSize(horizontal: false, vertical: true)  // Prevent truncation
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.vertical)
                 .foregroundColor(
                     modelLoaderWrapper.currentStatus.lowercased().contains("error")
                         ? .red
                         : (modelLoaderWrapper.currentStatus.lowercased().contains("success")
-                            ? .green : .secondary))
+                            ? .green : .secondary)
+                )
 
-            // Optionally display loaded config details
             if let config = modelLoaderWrapper.loadedModelConfig {
                 Divider()
                 Text("Loaded Model Config:")
                     .font(.headline)
-                // Use Text concatenation or formatting for multi-line display
                 VStack(alignment: .leading, spacing: 2) {
                     Text(
                         String(
@@ -97,15 +98,13 @@ struct ContentView: View {
                 }
                 .font(.system(.caption, design: .monospaced))
             }
-
-            Spacer()  // Pushes content up
+            Spacer()
         }
         .padding()
-        .frame(minWidth: 500, minHeight: 350)  // Adjusted height
+        .frame(minWidth: 500, minHeight: 350)
     }
 
-    // Function to handle file selection
-    // Calls the wrapper to load metadata
+    // File selection function remains the same
     private func selectGGUFFile() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -116,23 +115,19 @@ struct ContentView: View {
         if panel.runModal() == .OK {
             if let url = panel.url {
                 selectedFileURL = url
-                // Trigger metadata loading in the wrapper asynchronously
                 Task {
-                    isLoading = true  // Show loading indicator for metadata load
+                    isLoading = true
                     await modelLoaderWrapper.loadMetadata(url: url)
-                    isLoading = false  // Hide indicator after metadata load attempt
+                    isLoading = false
                 }
             } else {
-                // Handle error getting URL (rare)
-                Task { @MainActor in  // Ensure UI update is on main thread
+                Task { @MainActor in
                     selectedFileURL = nil
                     modelLoaderWrapper.currentStatus = "Error: Could not get URL for selected file."
                 }
             }
         } else {
-            // User cancelled - update status gently
             Task { @MainActor in
-                // Only update status if no file was previously selected
                 if selectedFileURL == nil {
                     modelLoaderWrapper.currentStatus = "File selection cancelled."
                 }
@@ -140,153 +135,157 @@ struct ContentView: View {
         }
     }
 
-    // Function to trigger full model loading
+    // Modified function to load model AND run the RoPE test
     @MainActor
-    private func loadFullModel() async {
+    private func loadFullModelAndTestRope() async {
         guard let urlToLoad = selectedFileURL else {
-            // This should be prevented by button disable state, but safety check
             modelLoaderWrapper.currentStatus = "Error: No file selected to load."
             return
         }
+        guard modelLoaderWrapper.isMetadataLoaded, modelLoaderWrapper.loadedModelConfig != nil
+        else {
+            modelLoaderWrapper.currentStatus =
+                "Error: Metadata or Config not loaded successfully before loading full model."
+            return
+        }
 
-        isLoading = true  // Show loading indicator
+        isLoading = true
 
-        // Call the wrapper's assembly function
+        // Step 1: Assemble the full model
         await modelLoaderWrapper.assembleFullModel(url: urlToLoad)
 
-        isLoading = false  // Hide loading indicator
-    }
-}
-
-// Wrapper class to hold onto our services and model data
-@MainActor  // Ensures changes/accesses happen on main thread
-class ModelLoaderWrapper: ObservableObject {
-
-    private var metalService: MetalService?
-    private var modelLoader: ModelLoader?
-
-    // State properties
-    @Published var currentStatus: String = "Not loaded"
-    @Published var isMetadataLoaded: Bool = false  // Track if metadata is ready
-    @Published var loadedModelConfig: LlamaConfig? = nil  // Store config after loading
-
-    // Store the fully loaded model (optional for now)
-    private var llamaModel: LlamaModel?
-
-    init() {
-        self.metalService = MetalService.shared
-        if self.metalService == nil {
-            currentStatus = "Error: Metal initialization failed!"
-            isMetadataLoaded = false
+        // Step 2: Check if model loading succeeded and run RoPE test
+        if !modelLoaderWrapper.currentStatus.lowercased().contains("error"),
+            let service = modelLoaderWrapper.getMetalService(),
+            let loadedModel = modelLoaderWrapper.getLoadedModel()
+        {
+            modelLoaderWrapper.currentStatus += "\nRunning RoPE kernel sanity check..."
+            testRopeKernel(metalService: service, model: loadedModel)
         } else {
-            // Initialize ModelLoader here
-            self.modelLoader = ModelLoader(metalService: metalService!)
-            currentStatus = "Metal Service Ready. Select a GGUF file."
-            isMetadataLoaded = false
+            print("Skipping RoPE test due to model loading failure or missing components.")
+            // Optionally update status message here too
+            // modelLoaderWrapper.currentStatus += "\nSkipping RoPE test."
         }
+
+        isLoading = false
     }
 
-    /// Loads *only* the metadata from the GGUF file.
-    func loadMetadata(url: URL) async {
-        guard let loader = self.modelLoader else {
-            currentStatus = "Error: ModelLoader not initialized."
-            isMetadataLoaded = false
+    // --- TEMPORARY RoPE TEST FUNCTION ---
+    private func testRopeKernel(metalService: MetalService, model: LlamaModel) {
+        // ... (Implementation of testRopeKernel as provided previously) ...
+        print("--- Running RoPE Sanity Check ---")
+        let config = model.config  // Get config from loaded model
+
+        let testSeqLen = 4
+        let testNumHeads = 2
+        let testHeadDim = config.headDim
+        guard config.ropeDimensionCount <= testHeadDim else {
+            print(
+                "RoPE Test Error: ropeDimensionCount (\(config.ropeDimensionCount)) > headDim (\(testHeadDim))"
+            )
+            return
+        }
+        let elementCount = testSeqLen * testNumHeads * testHeadDim
+        let bufferSize = elementCount * MemoryLayout<Float16>.size
+
+        guard bufferSize > 0 else {
+            print("RoPE Test Error: Invalid dimensions leading to zero buffer size.")
             return
         }
 
-        print("Wrapper: Attempting to load metadata from \(url.path)")
-        currentStatus = "Loading metadata..."
-        isMetadataLoaded = false
-        loadedModelConfig = nil
-        llamaModel = nil  // Clear any previously loaded model
+        var inputData = [Float16](repeating: 0, count: elementCount)
+        for i in 0..<elementCount { inputData[i] = Float16(i % 10) }
+        let originalData = inputData
 
-        do {
-            // Use Task to ensure loadMetadata runs off the main thread if it becomes heavy
-            try await Task { try loader.loadMetadata(url: url) }.value
-            currentStatus =
-                "Metadata loaded for \(url.lastPathComponent). Ready to load full model."
-            isMetadataLoaded = true
-            // Optionally, extract and publish config immediately after metadata load
-            // if LlamaConfig init doesn't throw often and is fast
-            if let metadata = loader.ggufFile?.metadata {
-                do {
-                    self.loadedModelConfig = try LlamaConfig(metadata: metadata)
-                    currentStatus += "\nConfig parsed."
-                } catch {
-                    currentStatus =
-                        "Metadata loaded, but failed to parse config: \(error.localizedDescription)"
-                    isMetadataLoaded = false  // Treat as not fully ready if config fails
+        guard
+            let testDataBuffer = metalService.device.makeBuffer(
+                bytes: &inputData, length: bufferSize, options: .storageModeShared)
+        else {
+            print("RoPE Test Error: Failed to create test data buffer.")
+            return
+        }
+        testDataBuffer.label = "RoPE Test Input/Output"
+
+        guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
+            print("RoPE Test Error: Failed to create command buffer.")
+            return
+        }
+        commandBuffer.label = "RoPE Test Command Buffer"
+
+        let success = metalService.applyRoPE(
+            commandBuffer: commandBuffer, buffer: testDataBuffer,
+            ropeFrequencies: model.ropeFrequencies,
+            config: config, posOffset: 0, sequenceLength: testSeqLen, numHeads: testNumHeads,
+            headDim: testHeadDim
+        )
+
+        guard success else {
+            print("RoPE Test FAILED: applyRoPE function returned false.")
+            return
+        }
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            print("RoPE Test FAILED: Command buffer execution failed: \(error)")
+            if let nsError = error as NSError? { print("  User Info: \(nsError.userInfo)") }
+            return
+        }
+
+        let resultPtr = testDataBuffer.contents().bindMemory(
+            to: Float16.self, capacity: elementCount)
+        let resultData = Array(UnsafeBufferPointer(start: resultPtr, count: elementCount))
+
+        var changedRotatedCount = 0
+        var changedNonRotatedCount = 0
+        var nanInfCount = 0
+        let ropeDims = config.ropeDimensionCount
+
+        for s in 0..<testSeqLen {
+            for h in 0..<testNumHeads {
+                for d in 0..<testHeadDim {
+                    let index = s * (testNumHeads * testHeadDim) + h * testHeadDim + d
+                    let originalValue = originalData[index]
+                    let resultValue = resultData[index]
+                    if !resultValue.isFinite { nanInfCount += 1 }
+                    if resultValue != originalValue {
+                        if d < ropeDims {
+                            changedRotatedCount += 1
+                        } else {
+                            changedNonRotatedCount += 1
+                        }
+                    }
                 }
             }
-
-        } catch let error as GGUFError {
-            currentStatus = "Error loading metadata (GGUF): \(error)"
-            isMetadataLoaded = false
-        } catch {
-            currentStatus = "Error loading metadata: \(error.localizedDescription)"
-            isMetadataLoaded = false
-        }
-        print("Wrapper: Metadata loading complete. Status: \(currentStatus)")
-    }
-
-    /// Loads the full model structure and tensors. Requires metadata to be loaded first.
-    func assembleFullModel(url: URL) async {
-        guard let loader = self.modelLoader else {
-            currentStatus = "Error: ModelLoader not initialized."
-            return
-        }
-        guard isMetadataLoaded else {
-            currentStatus = "Error: Metadata must be loaded before assembling the full model."
-            return
-        }
-        // Ensure the URL passed matches the one metadata was loaded from (optional sanity check)
-        guard url == loader.ggufFile?.url else {
-            currentStatus =
-                "Error: Attempting to load full model from a different URL (\(url.lastPathComponent)) than the loaded metadata (\(loader.ggufFile?.url.lastPathComponent ?? "None")). Please re-select the file."
-            isMetadataLoaded = false  // Require re-selection
-            return
         }
 
-        print("Wrapper: Attempting to assemble full model from \(url.path)")
-        currentStatus = "Loading full model tensors..."
-        llamaModel = nil  // Clear previous model instance
+        print("RoPE Test Results:")
+        print("  - Total Elements: \(elementCount)")
+        print("  - Rotated Dimensions per Head: \(ropeDims)")
+        print("  - Total Expected Rotated Elements: \(testSeqLen * testNumHeads * ropeDims)")
+        print("  - Values Changed within Rotated Dimensions: \(changedRotatedCount)")
+        print("  - Values Changed outside Rotated Dimensions: \(changedNonRotatedCount)")
+        print("  - NaN/Infinity count: \(nanInfCount)")
 
-        do {
-            // Call the main loading function in ModelLoader
-            let loadedModel = try await loader.loadLlamaModel(
-                url: url,
-                computePrecision: .f16,  // Keep compute as f16
-                normWeightType: .f32,  // Keep norms as f32
-                embeddingType: .f32  // Request F32 for embeddings
-            )
-
-            // Store the loaded model
-            self.llamaModel = loadedModel
-            self.loadedModelConfig = loadedModel.config  // Ensure config is updated
-
-            currentStatus = "Success: Full model '\(url.lastPathComponent)' loaded and assembled!"  // This message might change if Q6_K fails
-            print("Wrapper: Full model assembly complete.")
-
-        } catch let error as ModelLoaderError {
-            currentStatus = "Error assembling model: \(error)"  // More specific error from ModelLoader
-            print("Caught ModelLoaderError during assembly: \(error)")
-        } catch let error as ConfigError {
-            currentStatus = "Error reading config during assembly: \(error)"
-            print("Caught ConfigError during assembly: \(error)")
-        } catch {
-            currentStatus = "Unexpected error assembling model: \(error.localizedDescription)"
-            print("Caught unexpected error during assembly: \(error)")
+        if nanInfCount > 0 {
+            print("  - Sanity Check: FAILED (NaN/Inf detected)")
+        } else if changedRotatedCount == 0 {
+            print("  - Sanity Check: FAILED (No values changed within rotated dimensions)")
+        } else if changedNonRotatedCount > 0 {
+            print("  - Sanity Check: FAILED (Values outside rotated dimensions were changed!)")
+        } else {
+            print("  - Sanity Check: PASSED")
         }
-    }
 
-    // Optional: Function to clear the loaded model
-    func clearLoadedModel() {
-        llamaModel = nil
-        loadedModelConfig = nil
-        isMetadataLoaded = false
-        currentStatus = "Model unloaded. Select a GGUF file."
-        modelLoader?.unloadModel()  // Also clear caches in ModelLoader
-        print("Wrapper: Cleared loaded model.")
+        let printCount = min(elementCount, 32)
+        print(
+            "  - Original First \(printCount): \(originalData.prefix(printCount).map { String(format: "%.2f", Float($0)) })"
+        )
+        print(
+            "  - Result First \(printCount):   \(resultData.prefix(printCount).map { String(format: "%.2f", Float($0)) })"
+        )
+        print("--- RoPE Sanity Check Complete ---")
     }
 }
 

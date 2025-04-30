@@ -411,15 +411,28 @@ class ModelLoader {
         let outputWeightBuffer = try await getBuffer(
             try tensorName("output.weight", nil), embeddingType)  // Use embeddingType for output? Or computePrecision? Check Llama arch. Often shares type with embeddings.
 
+        // --- Load Optional RoPE Frequencies Tensor ---
         var ropeFreqsBuffer: MTLBuffer? = nil
         let ropeFreqsTensorName = "rope_freqs.weight"  // Standard name
-        if let ropeTensorDesc = self.getTensorDescriptor(name: ropeFreqsTensorName) {
-            print("Found optional RoPE frequencies tensor: \(ropeFreqsTensorName)")
-            // Load it as F32, as the kernel expects float factors
+        do {
+            // Directly try to get the buffer. getBuffer internally handles descriptor check.
             ropeFreqsBuffer = try await getBuffer(ropeFreqsTensorName, .f32)
-        } else {
-            print("Optional RoPE frequencies tensor '\(ropeFreqsTensorName)' not found.")
+            // If getBuffer succeeds, the tensor was found and loaded.
+            print("Found and loaded optional RoPE frequencies tensor: \(ropeFreqsTensorName)")
+        } catch ModelLoaderError.tensorNotFound {
+            // Explicitly catch the 'tensorNotFound' error. It's okay if this optional tensor is missing.
+            print(
+                "Optional RoPE frequencies tensor '\(ropeFreqsTensorName)' not found (this is often expected)."
+            )
+            ropeFreqsBuffer = nil  // Ensure it remains nil
+        } catch {
+            // If getBuffer throws *any other error* (e.g., dequantization failed, buffer creation failed),
+            // it's a real problem, so re-throw it to stop the model loading.
+            print(
+                "Error loading optional RoPE frequencies tensor '\(ropeFreqsTensorName)': \(error)")
+            throw error
         }
+        // --- End Loading Optional RoPE Frequencies ---
 
         print("Non-block tensors loaded.")
 
@@ -472,7 +485,7 @@ class ModelLoader {
             blocks: blocks,
             finalNormWeight: finalNormWeightBuffer,
             outputWeight: outputWeightBuffer,
-            ropeFrequencies: ropeFreqsBuffer  // Pass the optional buffer
+            ropeFrequencies: ropeFreqsBuffer  // Pass the result (could be nil)
         )
         print("LlamaModel assembly complete.")
         return llamaModel
