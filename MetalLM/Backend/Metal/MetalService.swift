@@ -35,10 +35,10 @@ struct MetalRopeArgs {
 
 /// Mirrors the RepeatKVHeadsArgs struct in AttentionKernels.metal
 struct RepeatKVHeadsArgs {
-    let num_kv_heads: UInt32     // Use fixed-size types matching Metal's uint
+    let num_kv_heads: UInt32  // Use fixed-size types matching Metal's uint
     let num_query_groups: UInt32
     let head_dim: UInt32
-    let seq_len: UInt32          // Sequence length being processed
+    let seq_len: UInt32  // Sequence length being processed
 
     // Ensure layout matches Metal struct if needed, though for simple types it's usually fine.
     // Swift automatically handles padding/alignment for these basic types to match Metal.
@@ -137,14 +137,15 @@ class MetalService {
             self.siluF16PipelineState = try makePipeline(functionName: "kernel_silu_f16")
             print("Pipeline state created for kernel_silu_f16")
             // --- END ADD ---
-            
+
             self.mulF16PipelineState = try makePipeline(functionName: "kernel_mul_f16")
             print("Pipeline state created for kernel_mul_f16")
-            
+
             self.addF16PipelineState = try makePipeline(functionName: "kernel_add_f16")
             print("Pipeline state created for kernel_add_f16")
-            
-            self.repeatKVHeadsPipelineState = try makePipeline(functionName: "kernel_repeat_kv_heads_f16")
+
+            self.repeatKVHeadsPipelineState = try makePipeline(
+                functionName: "kernel_repeat_kv_heads_f16")
             print("Pipeline state created for kernel_repeat_kv_heads_f16")
 
         } catch let error as MetalServiceError {
@@ -523,83 +524,156 @@ class MetalService {
         return outputBuffer
     }
 
+    // Inside MetalService class
+
     // MARK: - Inference Op Functions
-    func rmsNormF16(
+
+    /// Encodes the RMS Normalization operation onto a command buffer.
+    /// Normalizes each row of the input buffer and scales by the weight buffer.
+    ///
+    /// - Parameters:
+    ///   - commandBuffer: The command buffer to encode the operation onto. <--- ADDED
+    ///   - inputBuffer: The buffer containing input data (Float16).
+    ///   - weightBuffer: The buffer containing the scaling weights (gamma) (Float16).
+    ///   - outputBuffer: The buffer to write the normalized output (Float16).
+    ///   - rowCount: The number of rows (or batch size) to process.
+    ///   - elementCountPerRow: The number of elements in each row (embedding dimension).
+    ///   - eps: Epsilon value for numerical stability.
+    ///   - label: Optional label for the command encoder.
+    /// - Returns: True if encoding was successful, false otherwise.
+    func encodeRMSNormF16(  // <-- Renamed to encode...
+        commandBuffer: MTLCommandBuffer,  // <-- ADDED parameter
         inputBuffer: MTLBuffer,
         weightBuffer: MTLBuffer,
         outputBuffer: MTLBuffer,
         rowCount: Int,
         elementCountPerRow: Int,
-        eps: Float = 1e-5  // Corrected float literal
-    ) -> Bool {
-        guard rowCount > 0, elementCountPerRow > 0 else { return true }
+        eps: Float = 1e-5,
+        label: String? = nil
+    ) -> Bool {  // <-- Return Bool indicating encoding success
+        guard rowCount > 0, elementCountPerRow > 0 else {
+            print("Warning [RMSNorm Enc]: rowCount or elementCountPerRow is zero.")
+            return true  // Nothing to encode
+        }
 
-        let expectedInputSize = rowCount * elementCountPerRow * MemoryLayout<Float16>.size
-        let expectedWeightSize = elementCountPerRow * MemoryLayout<Float16>.size
-        guard inputBuffer.length >= expectedInputSize,
-            weightBuffer.length >= expectedWeightSize,
-            outputBuffer.length >= expectedInputSize
-        else {
-            print("Error [RMSNormF16]: Buffer size mismatch.")
-            // ... (print details) ...
+        // --- Buffer Size Validation ---
+        let expectedInputSize = rowCount * elementCountPerRow * MemoryLayout<Float16>.stride
+        let expectedWeightSize = elementCountPerRow * MemoryLayout<Float16>.stride  // Weights are per element in a row
+        guard inputBuffer.length >= expectedInputSize else {
+            print(
+                "Error [RMSNorm Enc]: Input buffer too small. Needs \(expectedInputSize), has \(inputBuffer.length)."
+            )
+            return false
+        }
+        guard weightBuffer.length >= expectedWeightSize else {
+            print(
+                "Error [RMSNorm Enc]: Weight buffer too small. Needs \(expectedWeightSize), has \(weightBuffer.length)."
+            )
+            return false
+        }
+        guard outputBuffer.length >= expectedInputSize else {  // Output has same size as input
+            print(
+                "Error [RMSNorm Enc]: Output buffer too small. Needs \(expectedInputSize), has \(outputBuffer.length)."
+            )
             return false
         }
 
+        // --- Prepare Arguments Buffer ---
         // Use the Swift struct here when creating the buffer
-        var args = MetalRMSNormArgs(eps: eps, ne00: UInt64(elementCountPerRow))
+        var args = MetalRMSNormArgs(eps: eps, ne00: UInt64(elementCountPerRow))  // ne00 is element count per row
         guard
             let argsBuffer = device.makeBuffer(
                 bytes: &args, length: MemoryLayout<MetalRMSNormArgs>.size,
-                options: .storageModeShared)
+                options: .storageModeShared  // Shared is fine for small, read-only args
+            )
         else {
-            print("Error [RMSNormF16]: Failed to create args buffer.")
+            print("Error [RMSNorm Enc]: Failed to create args buffer.")
             return false
         }
+        argsBuffer.label = label.map { "\($0)_Args" } ?? "RMSNorm_Args"
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-            let encoder = commandBuffer.makeComputeCommandEncoder()
-        else {
-            print("Error [RMSNormF16]: Failed to create command buffer/encoder.")
+        // --- Create Compute Encoder ---
+        // Use the *provided* commandBuffer
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            print("Error [RMSNorm Enc]: Failed to create compute command encoder.")
             return false
         }
-        encoder.label = "RMSNorm F16 Encoder"
+        encoder.label = label ?? "RMSNorm F16 Encoder"
 
+        // --- Set Pipeline and Buffers ---
         encoder.setComputePipelineState(rmsNormF16PipelineState)
         encoder.setBuffer(inputBuffer, offset: 0, index: 0)  // src
         encoder.setBuffer(weightBuffer, offset: 0, index: 1)  // weight (gamma)
         encoder.setBuffer(outputBuffer, offset: 0, index: 2)  // dst
         encoder.setBuffer(argsBuffer, offset: 0, index: 3)  // args
 
+        // --- Calculate Threadgroup Size and Memory ---
         let maxThreads = rmsNormF16PipelineState.maxTotalThreadsPerThreadgroup
-        var threadGroupWidth = min(maxThreads, 512)
-        if elementCountPerRow < threadGroupWidth {
-            threadGroupWidth = max(32, 1 << (flsl(elementCountPerRow - 1)))
-            threadGroupWidth = min(threadGroupWidth, maxThreads)
+        // Ensure threadGroupWidth calculation doesn't rely on potentially undefined behavior if elementCountPerRow is 0 or 1
+        var threadGroupWidth = min(maxThreads, 512)  // Default reasonable size
+        if elementCountPerRow > 0 {  // Check before using flsl
+            if elementCountPerRow < threadGroupWidth {
+                // Find nearest power of 2 >= elementCountPerRow, capped by maxThreads
+                let highestBitIndex = flsl(elementCountPerRow - 1)  // Find index of highest set bit (0-based)
+                // Use 1 << highestBitIndex only if highestBitIndex is valid (elementCountPerRow > 0)
+                if highestBitIndex >= 0 {
+                    threadGroupWidth = 1 << highestBitIndex  // Power of 2 <= elementCountPerRow
+                    if threadGroupWidth < elementCountPerRow {  // If not exact power of 2, go to next power of 2
+                        threadGroupWidth <<= 1
+                    }
+                } else {  // elementCountPerRow was 1
+                    threadGroupWidth = 1
+                }
+                threadGroupWidth = max(32, threadGroupWidth)  // Ensure at least SIMD group size (or reasonable minimum)
+                threadGroupWidth = min(threadGroupWidth, maxThreads)  // Cap at max allowed
+            }
+        } else {
+            threadGroupWidth = min(32, maxThreads)  // Use a minimum if elementCountPerRow is 0 (though caught earlier)
         }
-        threadGroupWidth = max(32, threadGroupWidth)
+        threadGroupWidth = max(32, threadGroupWidth)  // Final check for minimum sensible size
 
-        let threadGroupMemoryLength = (threadGroupWidth > 32) ? 32 * MemoryLayout<Float>.size : 0
-        if threadGroupMemoryLength > 0 {
-            encoder.setThreadgroupMemoryLength(threadGroupMemoryLength, index: 0)
+        // Threadgroup memory for reduction sum
+        let numSimdGroups = (threadGroupWidth + 31) / 32  // Ceiling division
+
+        // Calculate required size IF reducing (numSimdGroups > 1)
+        // Ensure the size is a multiple of 16 if > 0
+        var requiredMemoryForReduction = 0
+        if numSimdGroups > 1 {
+            let calculatedSize = numSimdGroups * MemoryLayout<Float>.size
+            // Ensure size is padded up to the next multiple of 16 if needed
+            requiredMemoryForReduction = (calculatedSize + 15) & ~15  // Pad to multiple of 16 bytes
         }
 
+        // --- FIX: Allocate a minimum of 16 bytes, or the padded required size ---
+        // Use the calculated padded size if > 0, otherwise use the minimum alignment (16 bytes).
+        let threadGroupMemoryLength =
+            (requiredMemoryForReduction > 0) ? requiredMemoryForReduction : 16
+
+        // Always set threadgroup memory length with the potentially adjusted, aligned, non-zero value
+        encoder.setThreadgroupMemoryLength(threadGroupMemoryLength, index: 0)
+        print(
+            "      Setting threadgroup memory length to \(threadGroupMemoryLength) for index 0 (numSimdGroups=\(numSimdGroups)). Required(padded): \(requiredMemoryForReduction)"
+        )
+        // --- END FIX ---
+
+        // --- Dispatch ---
         let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+        // Grid size is based on the number of rows we need to process independently
         let gridSize = MTLSize(width: rowCount, height: 1, depth: 1)
 
         print(
-            "Dispatching RMSNormF16: Grid=\(gridSize.width)x\(gridSize.height)x\(gridSize.depth), Group=\(threadGroupSize.width)x\(threadGroupSize.height)x\(threadGroupSize.depth)"
+            "Encoding RMSNormF16 (\(label ?? "No Label")): Grid=\(gridSize.width)x\(gridSize.height)x\(gridSize.depth), Group=\(threadGroupSize.width)x\(threadGroupSize.height)x\(threadGroupSize.depth)"
         )
         encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: threadGroupSize)
-        encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
 
-        if let error = commandBuffer.error {
-            print("Error [RMSNormF16]: Kernel execution failed: \(error)")
-            return false
-        }
-        print("Successfully executed RMSNorm F16 kernel.")  // Added success log
-        return true
+        // --- End Encoding ---
+        encoder.endEncoding()
+
+        // DO NOT commit or wait here - that's the caller's responsibility
+        // if let error = commandBuffer.error { ... } // Error checking happens after commit
+
+        print("Successfully encoded RMSNorm F16 kernel (\(label ?? "No Label")).")
+        return true  // Indicate encoding success
     }
 
     // MARK: - RoPE Functions
@@ -827,7 +901,7 @@ class MetalService {
         )
         return true
     }
-    
+
     /// Encodes a Softmax operation on the rows of a matrix using MPSMatrixSoftMax.
     ///
     /// - Parameters:
@@ -848,37 +922,43 @@ class MetalService {
     ) -> Bool {
 
         guard rows > 0, columns > 0 else {
-            print("Error [MPS SoftMax]: Rows and columns must be positive. Got rows=\(rows), columns=\(columns)")
+            print(
+                "Error [MPS SoftMax]: Rows and columns must be positive. Got rows=\(rows), columns=\(columns)"
+            )
             return false
         }
 
         let bytesPerElement = MemoryLayout<Float16>.stride
-        let rowBytes = columns * bytesPerElement // Each row has 'columns' elements
-        guard rowBytes > 0 else { // Ensure columns > 0 resulted in positive rowBytes
-             print("Error [MPS SoftMax]: Calculated rowBytes is not positive.")
-             return false
+        let rowBytes = columns * bytesPerElement  // Each row has 'columns' elements
+        guard rowBytes > 0 else {  // Ensure columns > 0 resulted in positive rowBytes
+            print("Error [MPS SoftMax]: Calculated rowBytes is not positive.")
+            return false
         }
 
         // --- Buffer Size Checks ---
         let expectedSize = rows * rowBytes
         guard inputMatrixBuffer.length >= expectedSize else {
-            print("Error [MPS SoftMax]: Input buffer too small. Needs \(expectedSize) (rows=\(rows), cols=\(columns)), has \(inputMatrixBuffer.length).")
+            print(
+                "Error [MPS SoftMax]: Input buffer too small. Needs \(expectedSize) (rows=\(rows), cols=\(columns)), has \(inputMatrixBuffer.length)."
+            )
             return false
         }
         guard outputMatrixBuffer.length >= expectedSize else {
-            print("Error [MPS SoftMax]: Output buffer too small. Needs \(expectedSize) (rows=\(rows), cols=\(columns)), has \(outputMatrixBuffer.length).")
+            print(
+                "Error [MPS SoftMax]: Output buffer too small. Needs \(expectedSize) (rows=\(rows), cols=\(columns)), has \(outputMatrixBuffer.length)."
+            )
             return false
         }
 
         // --- Create Descriptors & Matrices ---
         // MPSMatrixSoftMax operates row-wise, so descriptor matches input/output shape.
         // Initializers are non-failable according to compiler.
-        let desc = MPSMatrixDescriptor(rows: rows, columns: columns, rowBytes: rowBytes, dataType: .float16)
+        let desc = MPSMatrixDescriptor(
+            rows: rows, columns: columns, rowBytes: rowBytes, dataType: .float16)
 
         // Initialize directly, relying on size checks above.
         let inputMatrix = MPSMatrix(buffer: inputMatrixBuffer, descriptor: desc)
         let outputMatrix = MPSMatrix(buffer: outputMatrixBuffer, descriptor: desc)
-
 
         // --- Create and Encode Kernel ---
         // MPSMatrixSoftMax initializer is non-failable according to previous findings
@@ -891,10 +971,12 @@ class MetalService {
             resultMatrix: outputMatrix
         )
 
-        print("Successfully encoded \(softmaxKernel.label ?? "MPS SoftMax") for \(rows)x\(columns) matrix.")
+        print(
+            "Successfully encoded \(softmaxKernel.label ?? "MPS SoftMax") for \(rows)x\(columns) matrix."
+        )
         return true
     }
-    
+
     /// Encodes the SiLU activation function onto a command buffer.
     /// Operates element-wise: output = input * sigmoid(input)
     ///
@@ -908,7 +990,7 @@ class MetalService {
         inputBuffer: MTLBuffer,
         outputBuffer: MTLBuffer,
         elementCount: Int,
-        commandBuffer: MTLCommandBuffer // Takes command buffer as input
+        commandBuffer: MTLCommandBuffer  // Takes command buffer as input
     ) -> Bool {
         guard elementCount > 0 else {
             print("Warning [SiLU]: Attempting to apply SiLU with zero elements.")
@@ -919,22 +1001,25 @@ class MetalService {
         // Basic Size Check (Optional but good practice)
         let bufferSize = elementCount * MemoryLayout<Float16>.stride
         guard inputBuffer.length >= bufferSize, outputBuffer.length >= bufferSize else {
-            print("Error [SiLU]: Buffer size mismatch. Need \(bufferSize), Input=\(inputBuffer.length), Output=\(outputBuffer.length)")
+            print(
+                "Error [SiLU]: Buffer size mismatch. Need \(bufferSize), Input=\(inputBuffer.length), Output=\(outputBuffer.length)"
+            )
             return false
         }
 
         // Create buffer for element count argument
         var nelementsArg = UInt64(elementCount)
-        guard let nelementsBuffer = device.makeBuffer(
-            bytes: &nelementsArg,
-            length: MemoryLayout<UInt64>.size,
-            options: .storageModeShared // Or .storageModePrivate if only GPU access needed after creation
-        ) else {
+        guard
+            let nelementsBuffer = device.makeBuffer(
+                bytes: &nelementsArg,
+                length: MemoryLayout<UInt64>.size,
+                options: .storageModeShared  // Or .storageModePrivate if only GPU access needed after creation
+            )
+        else {
             print("Error [SiLU]: Failed to create nelements buffer.")
             return false
         }
         nelementsBuffer.label = "SiLU_nelements"
-
 
         // Encode kernel
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -944,13 +1029,13 @@ class MetalService {
         encoder.label = "SiLU Kernel Encoder"
 
         encoder.setComputePipelineState(siluF16PipelineState)
-        encoder.setBuffer(inputBuffer, offset: 0, index: 0)    // src
-        encoder.setBuffer(outputBuffer, offset: 0, index: 1)   // dst
-        encoder.setBuffer(nelementsBuffer, offset: 0, index: 2) // elementCount
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)  // src
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)  // dst
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 2)  // elementCount
 
         // Calculate grid and threadgroup sizes
         let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
-        let threadGroupWidth = min(siluF16PipelineState.maxTotalThreadsPerThreadgroup, 1024) // Simple kernel can use larger groups
+        let threadGroupWidth = min(siluF16PipelineState.maxTotalThreadsPerThreadgroup, 1024)  // Simple kernel can use larger groups
         let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
 
         encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
@@ -959,7 +1044,7 @@ class MetalService {
         print("Successfully encoded SiLU kernel for \(elementCount) elements.")
         return true
     }
-    
+
     /// Encodes an element-wise multiplication operation (C = A * B) onto a command buffer.
     func applyElementWiseMul(
         inputBufferA: MTLBuffer,
@@ -972,15 +1057,20 @@ class MetalService {
 
         let bufferSize = elementCount * MemoryLayout<Float16>.stride
         guard inputBufferA.length >= bufferSize,
-              inputBufferB.length >= bufferSize,
-              outputBufferC.length >= bufferSize else {
+            inputBufferB.length >= bufferSize,
+            outputBufferC.length >= bufferSize
+        else {
             print("Error [Mul]: Buffer size mismatch.")
             // Add details if needed
             return false
         }
 
         var nelementsArg = UInt64(elementCount)
-        guard let nelementsBuffer = device.makeBuffer(bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared) else {
+        guard
+            let nelementsBuffer = device.makeBuffer(
+                bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared
+            )
+        else {
             print("Error [Mul]: Failed to create nelements buffer.")
             return false
         }
@@ -993,10 +1083,10 @@ class MetalService {
         encoder.label = "ElementWise Mul Kernel Encoder"
 
         encoder.setComputePipelineState(mulF16PipelineState)
-        encoder.setBuffer(inputBufferA, offset: 0, index: 0)   // a
-        encoder.setBuffer(inputBufferB, offset: 0, index: 1)   // b
+        encoder.setBuffer(inputBufferA, offset: 0, index: 0)  // a
+        encoder.setBuffer(inputBufferB, offset: 0, index: 1)  // b
         encoder.setBuffer(outputBufferC, offset: 0, index: 2)  // c
-        encoder.setBuffer(nelementsBuffer, offset: 0, index: 3) // ne
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 3)  // ne
 
         let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
         let threadGroupWidth = min(mulF16PipelineState.maxTotalThreadsPerThreadgroup, 1024)
@@ -1008,7 +1098,7 @@ class MetalService {
         print("Successfully encoded ElementWise Mul kernel for \(elementCount) elements.")
         return true
     }
-    
+
     func applyElementWiseAdd(
         inputBufferA: MTLBuffer,
         inputBufferB: MTLBuffer,
@@ -1020,14 +1110,19 @@ class MetalService {
 
         let bufferSize = elementCount * MemoryLayout<Float16>.stride
         guard inputBufferA.length >= bufferSize,
-              inputBufferB.length >= bufferSize,
-              outputBufferC.length >= bufferSize else {
+            inputBufferB.length >= bufferSize,
+            outputBufferC.length >= bufferSize
+        else {
             print("Error [Add]: Buffer size mismatch.")
             return false
         }
 
         var nelementsArg = UInt64(elementCount)
-        guard let nelementsBuffer = device.makeBuffer(bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared) else {
+        guard
+            let nelementsBuffer = device.makeBuffer(
+                bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared
+            )
+        else {
             print("Error [Add]: Failed to create nelements buffer.")
             return false
         }
@@ -1040,10 +1135,10 @@ class MetalService {
         encoder.label = "ElementWise Add Kernel Encoder"
 
         encoder.setComputePipelineState(addF16PipelineState)
-        encoder.setBuffer(inputBufferA, offset: 0, index: 0)   // a
-        encoder.setBuffer(inputBufferB, offset: 0, index: 1)   // b
+        encoder.setBuffer(inputBufferA, offset: 0, index: 0)  // a
+        encoder.setBuffer(inputBufferB, offset: 0, index: 1)  // b
         encoder.setBuffer(outputBufferC, offset: 0, index: 2)  // c
-        encoder.setBuffer(nelementsBuffer, offset: 0, index: 3) // ne
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 3)  // ne
 
         let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
         let threadGroupWidth = min(addF16PipelineState.maxTotalThreadsPerThreadgroup, 1024)
@@ -1055,7 +1150,7 @@ class MetalService {
         print("Successfully encoded ElementWise Add kernel for \(elementCount) elements.")
         return true
     }
-    
+
     /// Encodes the kernel to repeat KV heads for Grouped Query Attention.
     /// Takes K or V with n_kv_heads and expands it to n_heads.
     ///
@@ -1090,11 +1185,15 @@ class MetalService {
         let expectedDestSize = seqLen * nHead * headDim * bytesPerElement
 
         guard sourceBuffer.length >= expectedSourceSize else {
-            print("Error [RepeatKV]: Source buffer too small. Needs \(expectedSourceSize), has \(sourceBuffer.length).")
+            print(
+                "Error [RepeatKV]: Source buffer too small. Needs \(expectedSourceSize), has \(sourceBuffer.length)."
+            )
             return false
         }
         guard destinationBuffer.length >= expectedDestSize else {
-             print("Error [RepeatKV]: Destination buffer too small. Needs \(expectedDestSize), has \(destinationBuffer.length).")
+            print(
+                "Error [RepeatKV]: Destination buffer too small. Needs \(expectedDestSize), has \(destinationBuffer.length)."
+            )
             return false
         }
 
@@ -1106,11 +1205,13 @@ class MetalService {
             seq_len: UInt32(seqLen)
         )
 
-        guard let argsBuffer = device.makeBuffer(
-            bytes: &args,
-            length: MemoryLayout<RepeatKVHeadsArgs>.size, // Use size of Swift struct
-            options: .storageModeShared
-        ) else {
+        guard
+            let argsBuffer = device.makeBuffer(
+                bytes: &args,
+                length: MemoryLayout<RepeatKVHeadsArgs>.size,  // Use size of Swift struct
+                options: .storageModeShared
+            )
+        else {
             print("Error [RepeatKV]: Failed to create args buffer.")
             return false
         }
@@ -1124,17 +1225,17 @@ class MetalService {
         encoder.label = "RepeatKVHeads Kernel Encoder"
 
         encoder.setComputePipelineState(repeatKVHeadsPipelineState)
-        encoder.setBuffer(sourceBuffer, offset: 0, index: 0)      // src
-        encoder.setBuffer(destinationBuffer, offset: 0, index: 1) // dst
-        encoder.setBuffer(argsBuffer, offset: 0, index: 2)        // args
+        encoder.setBuffer(sourceBuffer, offset: 0, index: 0)  // src
+        encoder.setBuffer(destinationBuffer, offset: 0, index: 1)  // dst
+        encoder.setBuffer(argsBuffer, offset: 0, index: 2)  // args
 
         // --- Dispatch Threads ---
         // Grid size matches the total number of elements in the *destination* buffer
         let totalDestElements = expectedDestSize / bytesPerElement
-        guard totalDestElements > 0 else { // Should be covered by dimension checks, but good practice
-             print("Error [RepeatKV]: Calculated zero destination elements.")
-             encoder.endEncoding() // Need to end encoding before returning false
-             return false
+        guard totalDestElements > 0 else {  // Should be covered by dimension checks, but good practice
+            print("Error [RepeatKV]: Calculated zero destination elements.")
+            encoder.endEncoding()  // Need to end encoding before returning false
+            return false
         }
 
         let gridSize = MTLSize(width: totalDestElements, height: 1, depth: 1)
@@ -1145,7 +1246,9 @@ class MetalService {
         encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
 
-        print("Successfully encoded RepeatKVHeads kernel for DestSize: \(seqLen)x\(nHead)x\(headDim).")
+        print(
+            "Successfully encoded RepeatKVHeads kernel for DestSize: \(seqLen)x\(nHead)x\(headDim)."
+        )
         return true
     }
 }

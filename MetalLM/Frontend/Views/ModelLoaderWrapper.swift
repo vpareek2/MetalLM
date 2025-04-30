@@ -1,11 +1,11 @@
 // MetalLM/Frontend/ViewModels/ModelLoaderWrapper.swift
 
-import SwiftUI // For ObservableObject, @Published, @MainActor
-import Foundation // For URL, etc.
-import Metal // Needed because LlamaModel holds MTLBuffers
+import Foundation  // For URL, etc.
+import Metal  // Needed because LlamaModel holds MTLBuffers
+import SwiftUI  // For ObservableObject, @Published, @MainActor
 
 // Wrapper class to hold onto our services and model data
-@MainActor // Ensures changes/accesses happen on main thread
+@MainActor  // Ensures changes/accesses happen on main thread
 class ModelLoaderWrapper: ObservableObject {
 
     private var metalService: MetalService?
@@ -13,22 +13,23 @@ class ModelLoaderWrapper: ObservableObject {
 
     // State properties
     @Published var currentStatus: String = "Not loaded"
-    @Published var isMetadataLoaded: Bool = false // Track if metadata is ready
-    @Published var loadedModelConfig: LlamaConfig? = nil // Store config after loading
+    @Published var isMetadataLoaded: Bool = false  // Track if metadata is ready
+    @Published var loadedModelConfig: LlamaConfig? = nil  // Store config after loading
 
     // Store the fully loaded model (make accessible via getter)
     private var llamaModel: LlamaModel?
+    private var llamaRunner: LlamaRunner?
 
     init() {
         self.metalService = MetalService.shared
         if self.metalService == nil {
-             currentStatus = "Error: Metal initialization failed!"
-             isMetadataLoaded = false
+            currentStatus = "Error: Metal initialization failed!"
+            isMetadataLoaded = false
         } else {
-             // Initialize ModelLoader here
-             self.modelLoader = ModelLoader(metalService: metalService!)
-             currentStatus = "Metal Service Ready. Select a GGUF file."
-             isMetadataLoaded = false
+            // Initialize ModelLoader here
+            self.modelLoader = ModelLoader(metalService: metalService!)
+            currentStatus = "Metal Service Ready. Select a GGUF file."
+            isMetadataLoaded = false
         }
     }
 
@@ -44,12 +45,13 @@ class ModelLoaderWrapper: ObservableObject {
         currentStatus = "Loading metadata..."
         isMetadataLoaded = false
         loadedModelConfig = nil
-        llamaModel = nil // Clear any previously loaded model
+        llamaModel = nil  // Clear any previously loaded model
 
         do {
             // Use Task to ensure loadMetadata runs off the main thread if it becomes heavy
             try await Task { try loader.loadMetadata(url: url) }.value
-            currentStatus = "Metadata loaded for \(url.lastPathComponent). Ready to load full model."
+            currentStatus =
+                "Metadata loaded for \(url.lastPathComponent). Ready to load full model."
             isMetadataLoaded = true
             // Optionally, extract and publish config immediately after metadata load
             if let metadata = loader.ggufFile?.metadata {
@@ -57,8 +59,9 @@ class ModelLoaderWrapper: ObservableObject {
                     self.loadedModelConfig = try LlamaConfig(metadata: metadata)
                     currentStatus += "\nConfig parsed."
                 } catch {
-                     currentStatus = "Metadata loaded, but failed to parse config: \(error.localizedDescription)"
-                     isMetadataLoaded = false // Treat as not fully ready if config fails
+                    currentStatus =
+                        "Metadata loaded, but failed to parse config: \(error.localizedDescription)"
+                    isMetadataLoaded = false  // Treat as not fully ready if config fails
                 }
             }
 
@@ -84,11 +87,11 @@ class ModelLoaderWrapper: ObservableObject {
         }
         // Ensure the URL passed matches the one metadata was loaded from
         guard url == loader.ggufFile?.url else {
-            currentStatus = "Error: Attempting to load full model from a different URL (\(url.lastPathComponent)) than the loaded metadata (\(loader.ggufFile?.url.lastPathComponent ?? "None")). Please re-select the file."
-            isMetadataLoaded = false // Require re-selection
+            currentStatus =
+                "Error: Attempting to load full model from a different URL (\(url.lastPathComponent)) than the loaded metadata (\(loader.ggufFile?.url.lastPathComponent ?? "None")). Please re-select the file."
+            isMetadataLoaded = false  // Require re-selection
             return
         }
-
 
         print("Wrapper: Attempting to assemble full model from \(url.path)")
         currentStatus = "Loading full model tensors..."
@@ -102,35 +105,57 @@ class ModelLoaderWrapper: ObservableObject {
                 url: url,
                 computePrecision: .f16,
                 normWeightType: .f32,
-                embeddingType: .f32 // Keep consistent with previous fix
+                embeddingType: .f32  // Keep consistent with previous fix
             )
 
             // Store the loaded model
             self.llamaModel = loadedModel
-            self.loadedModelConfig = loadedModel.config // Ensure config is updated
+            self.loadedModelConfig = loadedModel.config  // Ensure config is updated
 
-            currentStatus = "Success: Full model '\(url.lastPathComponent)' loaded and assembled!"
-            print("Wrapper: Full model assembly complete.")
+            // --- Instantiate the Runner ---
+            guard let service = self.metalService else {
+                // Should not happen if wrapper init succeeded, but check anyway
+                currentStatus = "Error: MetalService unavailable for Runner creation."
+                print("Error: MetalService unavailable when creating LlamaRunner.")
+                self.llamaModel = nil  // Clear model if runner fails
+                return
+            }
+            do {
+                self.llamaRunner = try LlamaRunner(model: loadedModel, metalService: service)
+                currentStatus =
+                    "Success: Full model '\(url.lastPathComponent)' loaded and Runner initialized!"
+                print("Wrapper: Full model assembly and Runner initialization complete.")
+            } catch let error as LlamaRunnerError {
+                currentStatus = "Model loaded, but Runner init failed (KV Cache?): \(error)"
+                print("LlamaRunner initialization failed: \(error)")
+                self.llamaModel = nil  // Clear model if runner fails
+            } catch {
+                currentStatus = "Model loaded, but Runner init failed unexpectedly: \(error)"
+                print("LlamaRunner initialization failed with unexpected error: \(error)")
+                self.llamaModel = nil  // Clear model if runner fails
+            }
+            // --- End Runner Instantiation ---
 
         } catch let error as ModelLoaderError {
-             currentStatus = "Error assembling model: \(error)"
-             print("Caught ModelLoaderError during assembly: \(error)")
+            currentStatus = "Error assembling model: \(error)"
+            print("Caught ModelLoaderError during assembly: \(error)")
         } catch let error as ConfigError {
-             currentStatus = "Error reading config during assembly: \(error)"
-             print("Caught ConfigError during assembly: \(error)")
+            currentStatus = "Error reading config during assembly: \(error)"
+            print("Caught ConfigError during assembly: \(error)")
         } catch {
-             currentStatus = "Unexpected error assembling model: \(error.localizedDescription)"
-             print("Caught unexpected error during assembly: \(error)")
+            currentStatus = "Unexpected error assembling model: \(error.localizedDescription)"
+            print("Caught unexpected error during assembly: \(error)")
         }
     }
 
     // Optional: Function to clear the loaded model
     func clearLoadedModel() {
+        llamaRunner = nil
         llamaModel = nil
         loadedModelConfig = nil
         isMetadataLoaded = false
         currentStatus = "Model unloaded. Select a GGUF file."
-        modelLoader?.unloadModel() // Also clear caches in ModelLoader
+        modelLoader?.unloadModel()  // Also clear caches in ModelLoader
         print("Wrapper: Cleared loaded model.")
     }
 }
@@ -147,5 +172,9 @@ extension ModelLoaderWrapper {
     func getLoadedModel() -> LlamaModel? {
         // Provide read-only access to the loaded model
         return self.llamaModel
+    }
+
+    func getLlamaRunner() -> LlamaRunner? {
+        return self.llamaRunner
     }
 }

@@ -51,26 +51,28 @@ struct ContentView: View {
                 Label("Run ElemWise Mul Test", systemImage: "multiply.square")
             }
             .padding(.bottom)
-            
+
             Button {
-                 if let service = modelLoaderWrapper.getMetalService() {
+                if let service = modelLoaderWrapper.getMetalService() {
                     testElementWiseAdd(metalService: service)
                 } else {
-                    modelLoaderWrapper.currentStatus = "Error: Metal Service not available for test."
+                    modelLoaderWrapper.currentStatus =
+                        "Error: Metal Service not available for test."
                 }
             } label: {
                 Label("Run ElemWise Add Test", systemImage: "plus.square")
             }
             .padding(.bottom)
-            
+
             Button {
-                 if let service = modelLoaderWrapper.getMetalService() {
+                if let service = modelLoaderWrapper.getMetalService() {
                     testRepeatKVHeads(metalService: service)
                 } else {
-                    modelLoaderWrapper.currentStatus = "Error: Metal Service not available for test."
+                    modelLoaderWrapper.currentStatus =
+                        "Error: Metal Service not available for test."
                 }
             } label: {
-                Label("Run GQA Repeat Test", systemImage: "rectangle.3.group") // Icon suggestion
+                Label("Run GQA Repeat Test", systemImage: "rectangle.3.group")  // Icon suggestion
             }
             .padding(.bottom)
 
@@ -99,20 +101,47 @@ struct ContentView: View {
                 Label("Run MPS MatMul Test", systemImage: "function")
             }
             .padding(.vertical)
-            
+
             Button {
                 if let service = modelLoaderWrapper.getMetalService() {
-                   testMPSSoftMax(metalService: service)
-               } else {
-                   modelLoaderWrapper.currentStatus = "Error: Metal Service not available for test."
-               }
-           } label: {
-               Label("Run MPS SoftMax Test", systemImage: "chart.bar") // Icon suggestion
-           }
-           .padding(.bottom)
+                    testMPSSoftMax(metalService: service)
+                } else {
+                    modelLoaderWrapper.currentStatus =
+                        "Error: Metal Service not available for test."
+                }
+            } label: {
+                Label("Run MPS SoftMax Test", systemImage: "chart.bar")  // Icon suggestion
+            }
+            .padding(.bottom)
 
-            // --- Optional: Keep the original Load & RoPE Test button ---
-            /*
+            Button {
+                if let service = modelLoaderWrapper.getMetalService() {
+                    testEncodeRMSNorm(metalService: service)  // Call the new test
+                } else {
+                    modelLoaderWrapper.currentStatus =
+                        "Error: Metal Service not available for test."
+                }
+            } label: {
+                Label("Run RMSNorm Encode Test", systemImage: "divide.square")  // Icon suggestion
+            }
+            .padding(.bottom)
+
+            // --- ADD Forward Pass Test Button ---
+            Button {
+                // Ensure model is loaded before running forward pass
+                guard modelLoaderWrapper.getLlamaRunner() != nil else {
+                    modelLoaderWrapper.currentStatus =
+                        "Please load a model before running the forward pass test."
+                    return
+                }
+                testForwardPassNoAttention()  // Call the test
+            } label: {
+                Label("Run Forward Pass (No Attn)", systemImage: "forward.frame")
+            }
+            .padding(.bottom)
+            // Disable button if runner isn't ready
+            .disabled(modelLoaderWrapper.getLlamaRunner() == nil || isLoading)
+
             Button {
                 Task {
                     await loadFullModelAndTestRope()
@@ -122,7 +151,6 @@ struct ContentView: View {
             }
             .disabled(selectedFileURL == nil || !modelLoaderWrapper.isMetadataLoaded || isLoading)
             .padding(.vertical)
-            */
 
             Divider()
 
@@ -409,7 +437,7 @@ struct ContentView: View {
         print("--- ElementWise Mul Test Complete ---")
         self.modelLoaderWrapper.currentStatus = testResultMessage
     }
-    
+
     @MainActor
     private func testElementWiseAdd(metalService: MetalService) {
         self.modelLoaderWrapper.currentStatus = "Running ElementWise Add Test..."
@@ -418,16 +446,20 @@ struct ContentView: View {
         let device = metalService.device
 
         // --- Define Test Data ---
-        let inputA: [Float16] = [1.0,  2.0, -3.0, 0.5, 10.0, -5.0]
-        let inputB: [Float16] = [2.0, -0.5,  2.0, 4.0, -0.1,  5.0]
-        let expectedOutput: [Float16] = [3.0,  1.5, -1.0, 4.5,  9.9,  0.0] // A + B
+        let inputA: [Float16] = [1.0, 2.0, -3.0, 0.5, 10.0, -5.0]
+        let inputB: [Float16] = [2.0, -0.5, 2.0, 4.0, -0.1, 5.0]
+        let expectedOutput: [Float16] = [3.0, 1.5, -1.0, 4.5, 9.9, 0.0]  // A + B
         let elementCount = inputA.count
 
         // --- Create Metal Buffers ---
         let bufferSize = elementCount * MemoryLayout<Float16>.stride
-        guard let bufferA = device.makeBuffer(bytes: inputA, length: bufferSize, options: .storageModeShared),
-              let bufferB = device.makeBuffer(bytes: inputB, length: bufferSize, options: .storageModeShared),
-              let bufferC = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
+        guard
+            let bufferA = device.makeBuffer(
+                bytes: inputA, length: bufferSize, options: .storageModeShared),
+            let bufferB = device.makeBuffer(
+                bytes: inputB, length: bufferSize, options: .storageModeShared),
+            let bufferC = device.makeBuffer(length: bufferSize, options: .storageModeShared)
+        else {
             print("Add Test Error: Failed to create buffers.")
             self.modelLoaderWrapper.currentStatus = "Add Test Error: Failed to create buffers."
             return
@@ -439,7 +471,8 @@ struct ContentView: View {
         // --- Encode and Execute ---
         guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
             print("Add Test Error: Failed to create command buffer.")
-            self.modelLoaderWrapper.currentStatus = "Add Test Error: Failed to create command buffer."
+            self.modelLoaderWrapper.currentStatus =
+                "Add Test Error: Failed to create command buffer."
             return
         }
         commandBuffer.label = "Add Test CB"
@@ -465,7 +498,8 @@ struct ContentView: View {
         var testResultMessage = ""
         if let error = commandBuffer.error {
             print("Add Test Error: Command buffer execution failed: \(error)")
-            testResultMessage = "Add Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+            testResultMessage =
+                "Add Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
         } else {
             var resultData = [Float16](repeating: 0, count: elementCount)
             let resultPtr = bufferC.contents().bindMemory(to: Float16.self, capacity: elementCount)
@@ -478,7 +512,9 @@ struct ContentView: View {
             for i in 0..<elementCount {
                 if abs(resultData[i] - expectedOutput[i]) > tolerance {
                     mismatch = true
-                    print("Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])")
+                    print(
+                        "Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])"
+                    )
                 }
             }
 
@@ -498,7 +534,7 @@ struct ContentView: View {
         print("--- ElementWise Add Test Complete ---")
         self.modelLoaderWrapper.currentStatus = testResultMessage
     }
-    
+
     @MainActor
     private func testRepeatKVHeads(metalService: MetalService) {
         self.modelLoaderWrapper.currentStatus = "Running GQA Repeat KV Heads Test..."
@@ -508,12 +544,14 @@ struct ContentView: View {
 
         // --- Define Test Parameters ---
         let seqLen = 2
-        let numKVHeads = 2 // Number of K/V heads in source
-        let headDim = 4    // Dimension of each head
-        let numQueryGroups = 3 // Each KV head is shared by 3 Query heads
-        let nHead = numKVHeads * numQueryGroups // Total number of heads in destination (2 * 3 = 6)
+        let numKVHeads = 2  // Number of K/V heads in source
+        let headDim = 4  // Dimension of each head
+        let numQueryGroups = 3  // Each KV head is shared by 3 Query heads
+        let nHead = numKVHeads * numQueryGroups  // Total number of heads in destination (2 * 3 = 6)
 
-        print("  Params: SeqLen=\(seqLen), KVHeads=\(numKVHeads), HeadDim=\(headDim), Groups=\(numQueryGroups), TotalHeads=\(nHead)")
+        print(
+            "  Params: SeqLen=\(seqLen), KVHeads=\(numKVHeads), HeadDim=\(headDim), Groups=\(numQueryGroups), TotalHeads=\(nHead)"
+        )
 
         // --- Create Source Data ---
         // Layout: [seqLen, numKVHeads, headDim]
@@ -534,8 +572,8 @@ struct ContentView: View {
         // Layout: [seqLen, nHead, headDim]
         var expectedOutput = [Float16]()
         for s in 0..<seqLen {
-            for h in 0..<nHead { // Iterate through destination heads
-                let src_h = h / numQueryGroups // Find the source head index
+            for h in 0..<nHead {  // Iterate through destination heads
+                let src_h = h / numQueryGroups  // Find the source head index
                 for d in 0..<headDim {
                     // Get the corresponding value from the source head
                     let srcValue = Float16(1000 * s + 100 * src_h + d)
@@ -544,23 +582,28 @@ struct ContentView: View {
             }
         }
         let destElementCount = expectedOutput.count
-        print("  Expected Dest Data (\(destElementCount) elements): \(expectedOutput.map { Float($0) })")
-
+        print(
+            "  Expected Dest Data (\(destElementCount) elements): \(expectedOutput.map { Float($0) })"
+        )
 
         // --- Create Metal Buffers ---
         let sourceBufferSize = sourceElementCount * MemoryLayout<Float16>.stride
         let destBufferSize = destElementCount * MemoryLayout<Float16>.stride
 
         guard sourceBufferSize > 0, destBufferSize > 0 else {
-             print("GQA Repeat Test Error: Calculated buffer size is zero.")
-             self.modelLoaderWrapper.currentStatus = "GQA Repeat Test Error: Zero buffer size."
-             return
+            print("GQA Repeat Test Error: Calculated buffer size is zero.")
+            self.modelLoaderWrapper.currentStatus = "GQA Repeat Test Error: Zero buffer size."
+            return
         }
 
-        guard let sourceBuffer = device.makeBuffer(bytes: sourceData, length: sourceBufferSize, options: .storageModeShared),
-              let destBuffer = device.makeBuffer(length: destBufferSize, options: .storageModeShared) else {
+        guard
+            let sourceBuffer = device.makeBuffer(
+                bytes: sourceData, length: sourceBufferSize, options: .storageModeShared),
+            let destBuffer = device.makeBuffer(length: destBufferSize, options: .storageModeShared)
+        else {
             print("GQA Repeat Test Error: Failed to create buffers.")
-            self.modelLoaderWrapper.currentStatus = "GQA Repeat Test Error: Failed to create buffers."
+            self.modelLoaderWrapper.currentStatus =
+                "GQA Repeat Test Error: Failed to create buffers."
             return
         }
         sourceBuffer.label = "GQA Repeat Test Source"
@@ -569,7 +612,8 @@ struct ContentView: View {
         // --- Encode and Execute ---
         guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
             print("GQA Repeat Test Error: Failed to create command buffer.")
-            self.modelLoaderWrapper.currentStatus = "GQA Repeat Test Error: Failed to create command buffer."
+            self.modelLoaderWrapper.currentStatus =
+                "GQA Repeat Test Error: Failed to create command buffer."
             return
         }
         commandBuffer.label = "GQA Repeat Test CB"
@@ -597,24 +641,28 @@ struct ContentView: View {
         var testResultMessage = ""
         if let error = commandBuffer.error {
             print("GQA Repeat Test Error: Command buffer execution failed: \(error)")
-            testResultMessage = "GQA Repeat Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+            testResultMessage =
+                "GQA Repeat Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
         } else {
             var resultData = [Float16](repeating: 0, count: destElementCount)
-            let resultPtr = destBuffer.contents().bindMemory(to: Float16.self, capacity: destElementCount)
+            let resultPtr = destBuffer.contents().bindMemory(
+                to: Float16.self, capacity: destElementCount)
             let sourceBufferPtr = UnsafeBufferPointer(start: resultPtr, count: destElementCount)
             // Apply fix for warning
             _ = resultData.withUnsafeMutableBufferPointer { $0.initialize(from: sourceBufferPtr) }
 
-            let tolerance: Float16 = 0.01 // Exact copy, tolerance should be near zero
+            let tolerance: Float16 = 0.01  // Exact copy, tolerance should be near zero
             var mismatch = false
             for i in 0..<destElementCount {
                 if abs(resultData[i] - expectedOutput[i]) > tolerance {
                     mismatch = true
-                    print("Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])")
+                    print(
+                        "Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])"
+                    )
                 }
             }
 
-            let resultStrings = resultData.map { String(format: "%.0f", Float($0)) } // Use %.0f for integer-like values
+            let resultStrings = resultData.map { String(format: "%.0f", Float($0)) }  // Use %.0f for integer-like values
             let expectedStrings = expectedOutput.map { String(format: "%.0f", Float($0)) }
 
             // Print smaller chunks if output is large
@@ -881,6 +929,150 @@ struct ContentView: View {
         // Update status on main thread
         self.modelLoaderWrapper.currentStatus = testResultMessage
     }
+
+    // Inside ContentView struct
+
+    // --- ADDED RMSNorm Encode TEST FUNCTION ---
+    @MainActor
+    private func testEncodeRMSNorm(metalService: MetalService) {
+        self.modelLoaderWrapper.currentStatus = "Running RMSNorm Encode Test..."
+        print("--- Running RMSNorm Encode Test ---")
+
+        let device = metalService.device
+
+        // --- Define Test Parameters ---
+        let rowCount = 2
+        let elementCountPerRow = 8  // Keep it small for easy verification
+        let eps: Float = 1e-5
+
+        // --- Create Test Data ---
+        // Row 0: Some positive/negative values
+        // Row 1: All same value
+        let inputData: [Float16] = [
+            1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0,
+            2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+        ]
+        // Simple weights (gamma) = 1.0 for easy verification of normalization
+        let weightData: [Float16] = Array(repeating: 1.0, count: elementCountPerRow)
+
+        let elementCountTotal = rowCount * elementCountPerRow
+
+        // --- Calculate Expected Output ---
+        var expectedOutput = [Float16](repeating: 0, count: elementCountTotal)
+        for r in 0..<rowCount {
+            let rowOffset = r * elementCountPerRow
+            var sumSq: Float = 0.0
+            // Calculate sum of squares for the row
+            for c in 0..<elementCountPerRow {
+                let val = Float(inputData[rowOffset + c])
+                sumSq += val * val
+            }
+            // Calculate RMS scale factor
+            let meanSq = sumSq / Float(elementCountPerRow)
+            let rms = sqrt(meanSq + eps)
+            let scale = 1.0 / rms
+            // Apply normalization and weight (which is 1.0)
+            for c in 0..<elementCountPerRow {
+                let normalizedVal = Float(inputData[rowOffset + c]) * scale * Float(weightData[c])
+                expectedOutput[rowOffset + c] = Float16(normalizedVal)
+            }
+        }
+
+        // --- Create Metal Buffers ---
+        let inputBufferSize = elementCountTotal * MemoryLayout<Float16>.stride
+        let weightBufferSize = elementCountPerRow * MemoryLayout<Float16>.stride
+        let outputBufferSize = elementCountTotal * MemoryLayout<Float16>.stride
+
+        guard
+            let inputBuffer = device.makeBuffer(
+                bytes: inputData, length: inputBufferSize, options: .storageModeShared),
+            let weightBuffer = device.makeBuffer(
+                bytes: weightData, length: weightBufferSize, options: .storageModeShared),
+            let outputBuffer = device.makeBuffer(
+                length: outputBufferSize, options: .storageModeShared)
+        else {
+            print("RMSNorm Test Error: Failed to create buffers.")
+            self.modelLoaderWrapper.currentStatus = "RMSNorm Test Error: Failed to create buffers."
+            return
+        }
+        inputBuffer.label = "RMSNorm Test Input"
+        weightBuffer.label = "RMSNorm Test Weights"
+        outputBuffer.label = "RMSNorm Test Output"
+
+        // --- Get Command Buffer ---
+        guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
+            print("RMSNorm Test Error: Failed to create command buffer.")
+            self.modelLoaderWrapper.currentStatus =
+                "RMSNorm Test Error: Failed to create command buffer."
+            return
+        }
+        commandBuffer.label = "RMSNorm Test CB"
+
+        // --- Encode the RMSNorm Kernel ---
+        let success = metalService.encodeRMSNormF16(
+            commandBuffer: commandBuffer,  // Pass the command buffer
+            inputBuffer: inputBuffer,
+            weightBuffer: weightBuffer,
+            outputBuffer: outputBuffer,
+            rowCount: rowCount,
+            elementCountPerRow: elementCountPerRow,
+            eps: eps,
+            label: "TestRMSNormEncode"
+        )
+
+        guard success else {
+            print("RMSNorm Test Error: encodeRMSNormF16 returned false.")
+            self.modelLoaderWrapper.currentStatus = "RMSNorm Test Error: Encoding failed."
+            // No need to commit if encoding failed
+            return
+        }
+
+        // --- Commit and Wait --- THIS IS NOW DONE IN THE TEST
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // --- Verify Results ---
+        var testResultMessage = ""
+        if let error = commandBuffer.error {
+            print("RMSNorm Test Error: Command buffer execution failed: \(error)")
+            testResultMessage =
+                "RMSNorm Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+        } else {
+            var resultData = [Float16](repeating: 0, count: elementCountTotal)
+            let resultPtr = outputBuffer.contents().bindMemory(
+                to: Float16.self, capacity: elementCountTotal)
+            let sourceBufferPtr = UnsafeBufferPointer(start: resultPtr, count: elementCountTotal)
+            // Apply fix for warning
+            _ = resultData.withUnsafeMutableBufferPointer { $0.initialize(from: sourceBufferPtr) }
+
+            let tolerance: Float16 = 0.01
+            var mismatch = false
+            print("RMSNorm Test Verification:")
+            for i in 0..<elementCountTotal {
+                if abs(resultData[i] - expectedOutput[i]) > tolerance {
+                    mismatch = true
+                    print(
+                        "  Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])"
+                    )
+                }
+            }
+
+            let resultStrings = resultData.map { String(format: "%.3f", Float($0)) }
+            let expectedStrings = expectedOutput.map { String(format: "%.3f", Float($0)) }
+
+            print("RMSNorm Test Result:   \(resultStrings)")
+            print("RMSNorm Test Expected: \(expectedStrings)")
+
+            if mismatch {
+                testResultMessage = "RMSNorm Test FAILED: Results do not match expected values."
+            } else {
+                testResultMessage = "RMSNorm Test PASSED!"
+            }
+            print(testResultMessage)
+        }
+        print("--- RMSNorm Encode Test Complete ---")
+        self.modelLoaderWrapper.currentStatus = testResultMessage
+    }
     // Inside ContentView struct
 
     // --- ADDED MPS SoftMax TEST FUNCTION ---
@@ -894,8 +1086,10 @@ struct ContentView: View {
         // --- Define Test Data (e.g., 2 rows, 4 columns) ---
         let rows = 2
         let columns = 4
-        let inputData: [Float16] = [1.0, 2.0, 3.0, 4.0,  // Row 0 (logits)
-                                    -1.0, 0.0, 1.0, 0.5] // Row 1 (logits)
+        let inputData: [Float16] = [
+            1.0, 2.0, 3.0, 4.0,  // Row 0 (logits)
+            -1.0, 0.0, 1.0, 0.5,
+        ]  // Row 1 (logits)
         let elementCount = rows * columns
 
         // Calculate expected output manually (using Float for intermediate precision)
@@ -917,8 +1111,11 @@ struct ContentView: View {
 
         // --- Create Metal Buffers ---
         let bufferSize = elementCount * MemoryLayout<Float16>.stride
-        guard let inputBuffer = device.makeBuffer(bytes: inputData, length: bufferSize, options: .storageModeShared),
-              let outputBuffer = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
+        guard
+            let inputBuffer = device.makeBuffer(
+                bytes: inputData, length: bufferSize, options: .storageModeShared),
+            let outputBuffer = device.makeBuffer(length: bufferSize, options: .storageModeShared)
+        else {
             print("SoftMax Test Error: Failed to create buffers.")
             self.modelLoaderWrapper.currentStatus = "SoftMax Test Error: Failed to create buffers."
             return
@@ -929,7 +1126,8 @@ struct ContentView: View {
         // --- Encode and Execute ---
         guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
             print("SoftMax Test Error: Failed to create command buffer.")
-            self.modelLoaderWrapper.currentStatus = "SoftMax Test Error: Failed to create command buffer."
+            self.modelLoaderWrapper.currentStatus =
+                "SoftMax Test Error: Failed to create command buffer."
             return
         }
         commandBuffer.label = "SoftMax Test CB"
@@ -955,15 +1153,17 @@ struct ContentView: View {
         var testResultMessage = ""
         if let error = commandBuffer.error {
             print("SoftMax Test Error: Command buffer execution failed: \(error)")
-            testResultMessage = "SoftMax Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+            testResultMessage =
+                "SoftMax Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
         } else {
             var resultData = [Float16](repeating: 0, count: elementCount)
-            let resultPtr = outputBuffer.contents().bindMemory(to: Float16.self, capacity: elementCount)
+            let resultPtr = outputBuffer.contents().bindMemory(
+                to: Float16.self, capacity: elementCount)
             let sourceBufferPtr = UnsafeBufferPointer(start: resultPtr, count: elementCount)
             // Apply fix for warning
             _ = resultData.withUnsafeMutableBufferPointer { $0.initialize(from: sourceBufferPtr) }
 
-            let tolerance: Float16 = 0.01 // Softmax involves exp, might need slightly larger tolerance
+            let tolerance: Float16 = 0.01  // Softmax involves exp, might need slightly larger tolerance
             var mismatch = false
             var rowSums: [Float] = Array(repeating: 0.0, count: rows)
 
@@ -975,27 +1175,28 @@ struct ContentView: View {
                     let index = r * columns + c
                     let resultVal = resultData[index]
                     let expectedVal = expectedOutput[index]
-                    currentRowSum += Float(resultVal) // Sum results as Float
+                    currentRowSum += Float(resultVal)  // Sum results as Float
 
                     if abs(resultVal - expectedVal) > tolerance {
                         mismatch = true
-                        print("    Mismatch at [\(r),\(c)]: Got \(resultVal), Expected \(expectedVal)")
+                        print(
+                            "    Mismatch at [\(r),\(c)]: Got \(resultVal), Expected \(expectedVal)"
+                        )
                     }
                     // Check if value is valid probability (0 to 1)
                     if !(resultVal >= 0.0 && resultVal <= 1.0) {
-                         mismatch = true
-                         print("    Invalid probability at [\(r),\(c)]: Got \(resultVal)")
+                        mismatch = true
+                        print("    Invalid probability at [\(r),\(c)]: Got \(resultVal)")
                     }
                 }
                 rowSums[r] = currentRowSum
                 print("    Row Sum: \(currentRowSum)")
                 // Check if row sum is close to 1.0
-                if abs(currentRowSum - 1.0) > Float(tolerance * Float16(columns)) { // Allow larger tolerance for sum
-                     mismatch = true
-                     print("    Row Sum deviates significantly from 1.0!")
+                if abs(currentRowSum - 1.0) > Float(tolerance * Float16(columns)) {  // Allow larger tolerance for sum
+                    mismatch = true
+                    print("    Row Sum deviates significantly from 1.0!")
                 }
             }
-
 
             let resultStrings = resultData.map { String(format: "%.4f", Float($0)) }
             let expectedStrings = expectedOutput.map { String(format: "%.4f", Float($0)) }
@@ -1011,6 +1212,89 @@ struct ContentView: View {
             print(testResultMessage)
         }
         print("--- MPS SoftMax Test Complete ---")
+        self.modelLoaderWrapper.currentStatus = testResultMessage
+    }
+
+    // Inside ContentView struct
+
+    // --- ADDED Forward Pass (No Attention) TEST FUNCTION ---
+    @MainActor
+    private func testForwardPassNoAttention() {
+        self.modelLoaderWrapper.currentStatus = "Running Forward Pass (No Attention) Test..."
+        print("--- Running Forward Pass (No Attention) Test ---")
+
+        // 1. Get Runner Instance
+        guard let runner = modelLoaderWrapper.getLlamaRunner() else {
+            let msg = "Forward Pass Test Error: LlamaRunner not initialized. Load model first."
+            print(msg)
+            self.modelLoaderWrapper.currentStatus = msg
+            // Optionally trigger model load here if desired for the test button
+            // Task { await loadFullModelAndTestRope() }
+            return
+        }
+
+        // 2. Reset State
+        runner.resetState()
+        guard runner.currentPosition == 0 else {
+            let msg = "Forward Pass Test Error: Runner state did not reset correctly."
+            print(msg)
+            self.modelLoaderWrapper.currentStatus = msg
+            return
+        }
+
+        // 3. Define Starting Token (Use a common BOS token ID - check your model's tokenizer.json if unsure)
+        // Common Llama BOS IDs are 1 or 128000. Let's assume 1 for now.
+        let bosTokenID = 1
+        // Alternative for Llama 3: 128000
+        // let bosTokenID = 128000
+        print("  Using BOS Token ID: \(bosTokenID)")
+
+        // 4. Execute Forward Pass
+        // Use Metal Frame Capture DURING this call if debugging!
+        print("  Calling runner.forward(tokenID: \(bosTokenID))...")
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        let logitsBuffer = runner.forward(tokenID: bosTokenID)
+
+        let endTime = CFAbsoluteTimeGetCurrent()
+        let duration = String(format: "%.3f", endTime - startTime)
+        print("  runner.forward call completed in \(duration) seconds.")
+
+        // 5. Verify Basic Results
+        var testResultMessage = ""
+        if let returnedLogits = logitsBuffer {
+            print("  Forward pass returned a logits buffer.")
+            // Basic validation on buffer
+            let expectedLogitsSize = runner.config.vocabSize * MemoryLayout<Float32>.stride  // Assuming F32 logits
+            // Or use F16 if you adjusted the forward pass:
+            // let expectedLogitsSize = runner.config.vocabSize * MemoryLayout<Float16>.stride
+            if returnedLogits.length >= expectedLogitsSize {
+                print(
+                    "  Logits buffer has expected size (or larger): \(returnedLogits.length) bytes."
+                )
+                // Check position increment
+                if runner.currentPosition == 1 {
+                    testResultMessage =
+                        "Forward Pass (No Attention) Test: PASSED (Executed without errors, position updated)."
+                    print("  Runner position correctly updated to \(runner.currentPosition).")
+                } else {
+                    testResultMessage =
+                        "Forward Pass (No Attention) Test: FAILED (Position not updated correctly, is \(runner.currentPosition))."
+                }
+            } else {
+                testResultMessage =
+                    "Forward Pass (No Attention) Test: FAILED (Logits buffer size mismatch. Expected >= \(expectedLogitsSize), Got \(returnedLogits.length))."
+            }
+            // TODO: Later, add sampling and check if the *next* token makes sense.
+            // For now, just checking execution success.
+
+        } else {
+            testResultMessage =
+                "Forward Pass (No Attention) Test: FAILED (Returned nil logits buffer - check console for errors)."
+        }
+
+        print(testResultMessage)
+        print("--- Forward Pass (No Attention) Test Complete ---")
         self.modelLoaderWrapper.currentStatus = testResultMessage
     }
 }
