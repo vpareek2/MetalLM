@@ -852,20 +852,23 @@ struct ContentView: View {
         }
         commandBuffer.label = "MPS MatMul Test CB"
 
-        // Call the helper function - CRITICAL: Set transposeB = true because B_data is row-major
-        // Inside testMPSMatMul in ContentView.swift
-
-        // Call the helper function - Set transposeB = false
+        // --- FIX: Update the call to use the new signature ---
         let success = metalService.encodeMPSMatrixMultiply(
             commandBuffer: commandBuffer,
-            inputA: bufferA,
-            inputB: bufferB,  // Still contains B_data_rowMajor (3x4)
-            outputC: bufferC,
-            M: M, N: N, K: K,
+            inputA: bufferA,  // Buffer A
+            inputB: bufferB,  // Buffer B (row-major 3x4)
+            outputC: bufferC,  // Buffer C
+            // Actual dimensions of data in buffers:
+            rowsA: M, colsA: K,  // bufferA is M rows, K columns (2x3)
+            rowsB: K, colsB: N,  // bufferB is K rows, N columns (3x4)
+            // Mathematical transpose flags for A * B:
             transposeA: false,
-            transposeB: false,  // <--- CHANGE THIS TO FALSE
-            label: "TestMatMul_2x3_3x4_tB_false"  // Update label for clarity
+            transposeB: false,  // Keep false as determined by previous successful test
+            alpha: 1.0,  // Optional, default
+            beta: 0.0,  // Optional, default
+            label: "TestMatMul_2x3_3x4_tB_false"
         )
+        // --- END FIX ---
 
         guard success else {
             print("MPS Test Error: encodeMPSMatrixMultiply returned false.")
@@ -1265,12 +1268,13 @@ struct ContentView: View {
         if let returnedLogits = logitsBuffer {
             print("  Forward pass returned a logits buffer.")
             // Basic validation on buffer
-            let expectedLogitsSize = runner.config.vocabSize * MemoryLayout<Float32>.stride  // Assuming F32 logits
-            // Or use F16 if you adjusted the forward pass:
-            // let expectedLogitsSize = runner.config.vocabSize * MemoryLayout<Float16>.stride
+            // --- FIX: Expect F16 size to match allocation ---
+            let expectedLogitsSize = runner.config.vocabSize * MemoryLayout<Float16>.stride
+            // --- END FIX ---
+
             if returnedLogits.length >= expectedLogitsSize {
                 print(
-                    "  Logits buffer has expected size (or larger): \(returnedLogits.length) bytes."
+                    "  Logits buffer has expected size (or larger): \(returnedLogits.length) bytes (Expected >= \(expectedLogitsSize))."
                 )
                 // Check position increment
                 if runner.currentPosition == 1 {

@@ -776,98 +776,94 @@ class MetalService {
         return true
     }
 
-    // Inside the MetalService class:
-
     /// Encodes a matrix multiplication operation (C = alpha * op(A) * op(B) + beta * C) onto the command buffer using MPS.
     /// Handles Float16 precision.
     ///
     /// - Parameters:
     ///   - commandBuffer: The command buffer to encode onto.
     ///   - inputA: Buffer containing the left matrix (A).
-    ///   - inputB: Buffer containing the right matrix (B) - often the weights.
+    ///   - inputB: Buffer containing the right matrix (B).
     ///   - outputC: Buffer where the result matrix (C) will be written.
-    ///   - M: Number of rows in matrix A (and C).
-    ///   - N: Number of columns in matrix B (and C).
-    ///   - K: Number of columns in matrix A / rows in matrix B (inner dimension).
-    ///   - transposeA: Whether to transpose matrix A before multiplication.
-    ///   - transposeB: Whether to transpose matrix B before multiplication. **Crucial for weight layout.**
-    ///   - alpha: Scaling factor for the product (A*B). Defaults to 1.0.
-    ///   - beta: Scaling factor for the initial value of C. Defaults to 0.0 (overwrite).
-    ///   - label: Optional label for the MPS kernel encoding for debugging.
-    /// - Returns: True if encoding was successful, false otherwise (basic check).
+    ///   - rowsA: Actual number of rows in the inputA buffer layout.
+    ///   - colsA: Actual number of columns in the inputA buffer layout.
+    ///   - rowsB: Actual number of rows in the inputB buffer layout.
+    ///   - colsB: Actual number of columns in the inputB buffer layout.
+    ///   - transposeA: Whether to treat A as transposed for the multiplication.
+    ///   - transposeB: Whether to treat B as transposed for the multiplication.
+    ///   - alpha: Scaling factor for the product. Defaults to 1.0.
+    ///   - beta: Scaling factor for the initial value of C. Defaults to 0.0.
+    ///   - label: Optional label for the MPS kernel encoding.
+    /// - Returns: True if encoding was successful, false otherwise.
     func encodeMPSMatrixMultiply(
         commandBuffer: MTLCommandBuffer,
         inputA: MTLBuffer,
         inputB: MTLBuffer,
         outputC: MTLBuffer,
-        M: Int,  // Use Int consistently
-        N: Int,
-        K: Int,
+        // Dimensions of matrices AS STORED IN BUFFERS
+        rowsA: Int,
+        colsA: Int,
+        rowsB: Int,
+        colsB: Int,
+        // Transpose flags for the MATH operation
         transposeA: Bool = false,
-        transposeB: Bool = false,  // Often TRUE if weights are loaded row-major
+        transposeB: Bool = false,
         alpha: Double = 1.0,
         beta: Double = 0.0,
         label: String? = nil
     ) -> Bool {
 
         // --- Basic Validation ---
-        guard M > 0, N > 0, K > 0 else {
-            print(
-                "Error [MPS MatMul]: Dimensions M, N, K must be positive. Got M=\(M), N=\(N), K=\(K)"
-            )
+        let bytesPerElement = MemoryLayout<Float16>.stride
+        guard rowsA > 0, colsA > 0, rowsB > 0, colsB > 0 else {
+            print("Error [MPS MatMul]: Buffer dimensions rowsA/colsA/rowsB/colsB must be positive.")
             return false
         }
 
-        // --- Calculate Row Bytes (as Int) ---
-        let bytesPerElement = MemoryLayout<Float16>.stride
-        let rowBytesA_Int = K * bytesPerElement  // A is MxK, so K columns
-        let rowBytesB_Int = N * bytesPerElement  // B is KxN, so N columns
-        let rowBytesC_Int = N * bytesPerElement  // C is MxN, so N columns
+        // --- Determine Mathematical Dimensions M, N, K based on transpose flags ---
+        // C[M, N] = op(A)[M, K] * op(B)[K, N]
+        let M = transposeA ? colsA : rowsA
+        let K_A = transposeA ? rowsA : colsA  // K derived from A
+        let K_B = transposeB ? colsB : rowsB  // K derived from B
+        let N = transposeB ? rowsB : colsB
+
+        // Validate K matches
+        guard K_A == K_B else {
+            print(
+                "Error [MPS MatMul]: Inner dimensions do not match after transpose. K_A(\(K_A)) != K_B(\(K_B))."
+            )
+            print(
+                "  rowsA=\(rowsA), colsA=\(colsA), rowsB=\(rowsB), colsB=\(colsB), tA=\(transposeA), tB=\(transposeB)"
+            )
+            return false
+        }
+        let K = K_A  // The common inner dimension
+
+        // --- Calculate Row Bytes based on ACTUAL columns in buffers ---
+        let rowBytesA_Int = colsA * bytesPerElement
+        let rowBytesB_Int = colsB * bytesPerElement
+        let rowBytesC_Int = N * bytesPerElement  // Output C always has N columns
 
         guard rowBytesA_Int > 0, rowBytesB_Int > 0, rowBytesC_Int > 0 else {
-            print(
-                "Error [MPS MatMul]: Calculated rowBytes must be positive. K=\(K), N=\(N)"
-            )
+            print("Error [MPS MatMul]: Calculated rowBytes must be positive.")
             return false
         }
 
-        // --- *** CRITICAL: Explicit Buffer Size Checks *** ---
-        // Size is rows * rowBytes needed.
-        let rowsA_desc = M
-        let rowsB_desc = K  // KxN descriptor
-        let rowsC_desc = M
+        // --- Buffer Size Checks based on ACTUAL layout ---
+        let expectedSizeA = rowsA * rowBytesA_Int
+        let expectedSizeB = rowsB * rowBytesB_Int
+        let expectedSizeC = M * rowBytesC_Int  // Output C always has M rows
 
-        let expectedSizeA = rowsA_desc * rowBytesA_Int
-        let expectedSizeB = rowsB_desc * rowBytesB_Int
-        let expectedSizeC = rowsC_desc * rowBytesC_Int
+        guard inputA.length >= expectedSizeA else { /* ... error ... */ return false }
+        guard inputB.length >= expectedSizeB else { /* ... error ... */ return false }
+        guard outputC.length >= expectedSizeC else { /* ... error ... */ return false }
 
-        guard inputA.length >= expectedSizeA else {
-            print(
-                "Error [MPS MatMul]: Buffer A too small. Needs \(expectedSizeA) (rows=\(rowsA_desc), rowBytes=\(rowBytesA_Int)), has \(inputA.length)."
-            )
-            return false
-        }
-        guard inputB.length >= expectedSizeB else {
-            print(
-                "Error [MPS MatMul]: Buffer B too small. Needs \(expectedSizeB) (rows=\(rowsB_desc), rowBytes=\(rowBytesB_Int)), has \(inputB.length)."
-            )
-            return false
-        }
-        guard outputC.length >= expectedSizeC else {
-            print(
-                "Error [MPS MatMul]: Buffer C too small. Needs \(expectedSizeC) (rows=\(rowsC_desc), rowBytes=\(rowBytesC_Int)), has \(outputC.length)."
-            )
-            return false
-        }
-        // --- End Buffer Size Checks ---
-
-        // --- Create MPSMatrix Descriptors ---
+        // --- Create Descriptors based on ACTUAL layout ---
         let descA = MPSMatrixDescriptor(
-            rows: M, columns: K, rowBytes: rowBytesA_Int, dataType: .float16)
+            rows: rowsA, columns: colsA, rowBytes: rowBytesA_Int, dataType: .float16)
         let descB = MPSMatrixDescriptor(
-            rows: K, columns: N, rowBytes: rowBytesB_Int, dataType: .float16)  // KxN descriptor
+            rows: rowsB, columns: colsB, rowBytes: rowBytesB_Int, dataType: .float16)
         let descC = MPSMatrixDescriptor(
-            rows: M, columns: N, rowBytes: rowBytesC_Int, dataType: .float16)
+            rows: M, columns: N, rowBytes: rowBytesC_Int, dataType: .float16)  // Output descriptor matches result dimensions
 
         // --- Create MPSMatrix Objects ---
         let matrixA = MPSMatrix(buffer: inputA, descriptor: descA)
@@ -875,14 +871,14 @@ class MetalService {
         let matrixC = MPSMatrix(buffer: outputC, descriptor: descC)
 
         // --- Create MPSMatrixMultiplication Kernel ---
-        // Kernel dimensions are based on the logical operation C[M,N] = op(A)[M,K] * op(B)[K,N]
+        // Use the MATHEMATICAL dimensions M, N, K derived earlier
         let matMulKernel = MPSMatrixMultiplication(
             device: self.device,
             transposeLeft: transposeA,
             transposeRight: transposeB,
-            resultRows: M,  // M rows in result C
-            resultColumns: N,  // N columns in result C
-            interiorColumns: K,  // K is the shared dimension
+            resultRows: M,
+            resultColumns: N,
+            interiorColumns: K,
             alpha: alpha,
             beta: beta
         )
@@ -897,7 +893,7 @@ class MetalService {
         )
 
         print(
-            "Successfully encoded \(matMulKernel.label ?? "MPS MatMul") M=\(M), N=\(N), K=\(K), tA=\(transposeA), tB=\(transposeB)"
+            "Successfully encoded \(matMulKernel.label ?? "MPS MatMul") M=\(M), N=\(N), K=\(K), tA=\(transposeA), tB=\(transposeB) (bufA:[\(rowsA)x\(colsA)], bufB:[\(rowsB)x\(colsB)])"
         )
         return true
     }

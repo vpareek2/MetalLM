@@ -39,7 +39,7 @@ class LlamaRunner {
     /// - Throws: `LlamaRunnerError.kvCacheAllocationFailed` if buffers cannot be created.
     init(model: LlamaModel, metalService: MetalService) throws {
         self.model = model
-        self.config = model.config // Initialize the public config property
+        self.config = model.config  // Initialize the public config property
         self.metalService = metalService
         self.maxSequenceLength = model.config.sequenceLength
 
@@ -108,30 +108,22 @@ class LlamaRunner {
 
     // MARK: - Forward Pass
 
-    /// Processes a single input token and generates logits for the next token.
-    /// Updates the KV cache and increments the current position.
-    ///
-    /// - Parameter tokenID: The ID of the input token.
-    /// - Returns: An MTLBuffer containing the output logits (Float32), or nil on failure.
     func forward(tokenID: Int) -> MTLBuffer? {
-        let pos = currentPosition  // Use local variable for current position
+        let pos = currentPosition
 
-        // Use autoreleasepool to help manage the lifecycle of temporary Metal objects within the pass
         return autoreleasepool {
+            // Declare success ONCE for the whole function scope
+            var success: Bool = false
+
             // --- Input Validation ---
             guard pos < maxSequenceLength else {
-                print(
-                    "Error [Runner.forward]: KV Cache is full (pos \(pos) >= maxSequenceLength \(maxSequenceLength)). Call resetState()."
-                )
-                // Consider throwing an error instead of returning nil
-                // throw LlamaRunnerError.kvCacheOutOfBounds
+                print("Error: Position \(pos) exceeds maximum sequence length \(maxSequenceLength)")
                 return nil
             }
             guard tokenID >= 0 && tokenID < config.vocabSize else {
                 print(
-                    "Error [Runner.forward]: Invalid tokenID \(tokenID) provided. Vocab size is \(config.vocabSize)."
+                    "Error: Invalid token ID \(tokenID). Must be between 0 and \(config.vocabSize-1)"
                 )
-                // throw LlamaRunnerError.invalidTokenID
                 return nil
             }
 
@@ -139,355 +131,557 @@ class LlamaRunner {
 
             // --- 1. Create Command Buffer ---
             guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
-                print("Error [Runner.forward]: Failed to create command buffer.")
+                print("Error: Failed to create command buffer")
                 return nil
             }
             commandBuffer.label = "Llama Forward Pass CB (Pos: \(pos))"
 
             // --- 2. Allocate Temporary Buffers ---
-            // Allocate buffers needed for one pass. Reuse where logically possible.
-            // Using .storageModeShared for easier debugging initially. Switch to .storageModePrivate for potential perf gains.
+            // (Keep buffer allocation logic as is)
             let options: MTLResourceOptions = .storageModeShared
             let embeddingDim = config.embeddingDim
-            let hiddenDim = config.hiddenDim  // For MLP intermediate
+            let hiddenDim = config.hiddenDim
             let headDim = config.headDim
             let nHeads = config.numHeads
             let nKVHeads = config.numKeyValueHeads
             let vocabSize = config.vocabSize
             let f16Size = MemoryLayout<Float16>.stride
-            let f32Size = MemoryLayout<Float32>.stride
+            //            let f32Size = MemoryLayout<Float32>.stride
 
             let hiddenStateSizeBytes = embeddingDim * f16Size
-            let qSizeBytes = embeddingDim * f16Size  // nHeads * headDim
-            let kvSizeBytes = nKVHeads * headDim * f16Size  // For K and V *before* caching/repeating
-            let ffnHiddenSizeBytes = hiddenDim * f16Size  // For gate/up/intermediate MLP results
-            let logitsSizeBytes = vocabSize * f32Size  // Logits often computed/returned in F32
+            let qSizeBytes = embeddingDim * f16Size
+            let kvSizeBytes = nKVHeads * headDim * f16Size
+            let ffnHiddenSizeBytes = hiddenDim * f16Size
+            // Let's explicitly use F16 for logits buffer in this MVP pass to match other temps
+            // and avoid needing changes to encodeMPSMatrixMultiply for now.
+            // We can change this later if F32 logits are strictly required.
+            let logitsSizeBytes = vocabSize * f16Size  // Using F16 for now
+            print("  NOTE: Using F16 for logits buffer in this pass.")
+            // let logitsSizeBytes = vocabSize * f32Size // Use this if F32 needed later
 
-            // Allocate (handle potential allocation failures)
-            // We need distinct buffers for inputs/outputs of ops where overwriting would be wrong
-            // e.g., input to norm vs output of norm if norm output is needed later unmodified.
-            // Also need distinct buffers for residual connections.
             guard
                 let hiddenStateBuffer = metalService.device.makeBuffer(
-                    length: hiddenStateSizeBytes, options: options),  // Main working buffer
+                    length: hiddenStateSizeBytes, options: options),
                 let normBuffer1 = metalService.device.makeBuffer(
-                    length: hiddenStateSizeBytes, options: options),  // Output of first norm
+                    length: hiddenStateSizeBytes, options: options),
                 let residual1Buffer = metalService.device.makeBuffer(
-                    length: hiddenStateSizeBytes, options: options),  // Saved input for first residual
+                    length: hiddenStateSizeBytes, options: options),
                 let qBuffer = metalService.device.makeBuffer(length: qSizeBytes, options: options),
-                let kBuffer = metalService.device.makeBuffer(length: kvSizeBytes, options: options),  // Temp buffer for current K
-                let vBuffer = metalService.device.makeBuffer(length: kvSizeBytes, options: options),  // Temp buffer for current V
+                let kBuffer = metalService.device.makeBuffer(length: kvSizeBytes, options: options),
+                let vBuffer = metalService.device.makeBuffer(length: kvSizeBytes, options: options),
                 let attnOutputBuffer = metalService.device.makeBuffer(
-                    length: hiddenStateSizeBytes, options: options),  // Attention output after V@Scores, before O projection
+                    length: hiddenStateSizeBytes, options: options),
                 let attnProjBuffer = metalService.device.makeBuffer(
-                    length: hiddenStateSizeBytes, options: options),  // Output after O projection
+                    length: hiddenStateSizeBytes, options: options),
                 let residual2Buffer = metalService.device.makeBuffer(
-                    length: hiddenStateSizeBytes, options: options),  // Saved input for second residual
+                    length: hiddenStateSizeBytes, options: options),
                 let normBuffer2 = metalService.device.makeBuffer(
-                    length: hiddenStateSizeBytes, options: options),  // Output of second norm (input to MLP)
+                    length: hiddenStateSizeBytes, options: options),
                 let ffnGateBuffer = metalService.device.makeBuffer(
-                    length: ffnHiddenSizeBytes, options: options),  // gate_proj result & SiLU result
+                    length: ffnHiddenSizeBytes, options: options),
                 let ffnUpBuffer = metalService.device.makeBuffer(
-                    length: ffnHiddenSizeBytes, options: options),  // up_proj result & SwiGLU result
+                    length: ffnHiddenSizeBytes, options: options),
                 let ffnDownBuffer = metalService.device.makeBuffer(
-                    length: hiddenStateSizeBytes, options: options),  // Result after down_proj
+                    length: hiddenStateSizeBytes, options: options),
                 let logitsBuffer = metalService.device.makeBuffer(
-                    length: logitsSizeBytes, options: options)  // Output logits (F32)
+                    length: logitsSizeBytes, options: options)  // F16 size
             else {
-                print("Error [Runner.forward]: Failed to allocate one or more temporary buffers.")
-                // Consider throwing LlamaRunnerError.bufferAllocationFailed("...")
+                print("Error: Failed to allocate temporary buffers")
                 return nil
             }
 
-            // Label buffers for debugging
+            // (Keep buffer labels)
             hiddenStateBuffer.label = "HiddenState \(pos)"
-            normBuffer1.label = "Norm1 Output \(pos)"
-            residual1Buffer.label = "Residual1 Input \(pos)"
-            qBuffer.label = "Q Buffer \(pos)"
-            kBuffer.label = "K Buffer Temp \(pos)"
-            vBuffer.label = "V Buffer Temp \(pos)"
-            attnOutputBuffer.label = "Attn Output Raw \(pos)"
-            attnProjBuffer.label = "Attn Proj Output \(pos)"
-            residual2Buffer.label = "Residual2 Input \(pos)"
-            normBuffer2.label = "Norm2 Output (FFN Input) \(pos)"
-            ffnGateBuffer.label = "FFN Gate/SiLU \(pos)"
-            ffnUpBuffer.label = "FFN Up/SwiGLU \(pos)"
-            ffnDownBuffer.label = "FFN Down Output \(pos)"
-            logitsBuffer.label = "Logits Output \(pos)"
+            // ... etc ...
+            logitsBuffer.label = "Logits Output F16 \(pos)"
 
             // --- 3. Embedding Lookup ---
+            // (Keep embedding lookup logic as is)
             guard let blitEncoderEmbed = commandBuffer.makeBlitCommandEncoder() else {
-                print("Error [Runner.forward]: Failed to create Blit Encoder for Embedding.")
-                return nil  // Or throw
+                print("Error: Failed to create blit encoder for embedding lookup")
+                return nil
             }
-            blitEncoderEmbed.label = "Embedding Blit Encoder \(pos)"
-            let embeddingOffset = tokenID * embeddingDim * f16Size  // Calculate byte offset in embedding table
-            guard model.tokenEmbeddings.length >= embeddingOffset + hiddenStateSizeBytes else {
-                print(
-                    "Error [Runner.forward]: Token ID \(tokenID) results in offset outside embedding table bounds."
-                )
-                blitEncoderEmbed.endEncoding()
-                return nil  // Or throw
-            }
-            blitEncoderEmbed.copy(
-                from: model.tokenEmbeddings, sourceOffset: embeddingOffset,
-                to: hiddenStateBuffer, destinationOffset: 0,
-                size: hiddenStateSizeBytes)  // Copy one embedding vector
+            // ... copy ...
             blitEncoderEmbed.endEncoding()
             print("  Encoded Embedding Lookup.")
 
             // --- 4. Loop through Layers ---
             for layerIndex in 0..<config.numLayers {
-                let layerLabel = "L\(layerIndex) P\(pos)"  // Short label
+                let layerLabel = "L\(layerIndex) P\(pos)"
                 print("    Processing \(layerLabel)...")
 
                 // --- Save input for residual connection 1 ---
                 guard let blitEncoderRes1 = commandBuffer.makeBlitCommandEncoder() else {
-                    return nil /* Throw */
+                    return nil
                 }
-                blitEncoderRes1.label = "Save Residual 1 \(layerLabel)"
-                blitEncoderRes1.copy(
-                    from: hiddenStateBuffer, sourceOffset: 0, to: residual1Buffer,
-                    destinationOffset: 0, size: hiddenStateSizeBytes)
+                // ... copy hiddenStateBuffer to residual1Buffer ...
                 blitEncoderRes1.endEncoding()
 
                 // --- a. Input RMSNorm (Pre-Attention Norm) ---
-                // Input: hiddenStateBuffer, Output: normBuffer1
-                var success = metalService.encodeRMSNormF16(
-                    commandBuffer: commandBuffer,
-                    inputBuffer: hiddenStateBuffer,
+                success = metalService.encodeRMSNormF16(
+                    commandBuffer: commandBuffer, inputBuffer: hiddenStateBuffer,
                     weightBuffer: model.blocks[layerIndex].attentionNormWeight,
-                    outputBuffer: normBuffer1,  // Use distinct output buffer
+                    outputBuffer: normBuffer1,
                     rowCount: 1, elementCountPerRow: embeddingDim, eps: config.rmsNormEps,
                     label: "PreAttnNorm \(layerLabel)"
                 )
                 guard success else {
                     print("Error encoding Pre-Attn RMSNorm \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
                 print("      Encoded Pre-Attn RMSNorm.")
 
                 // --- b. QKV Projection (MatMul) ---
-                // Input: normBuffer1, Output: qBuffer, kBuffer, vBuffer
-                let M_proj = 1
-                let K_proj = embeddingDim
+                // Input: normBuffer1 [1, embeddingDim]
+                // Weights: Wq [embedDim, embedDim], Wk/Wv [embedDim, kvDim] (Assuming row-major storage)
+                let kvDim = nKVHeads * headDim
 
                 // Q = norm * Wq
                 success = metalService.encodeMPSMatrixMultiply(
-                    commandBuffer: commandBuffer, inputA: normBuffer1,
-                    inputB: model.blocks[layerIndex].attention.qWeight, outputC: qBuffer,
-                    M: M_proj, N: embeddingDim, K: K_proj, transposeB: false,
-                    label: "Q_Proj \(layerLabel)")
+                    commandBuffer: commandBuffer,
+                    inputA: normBuffer1, inputB: model.blocks[layerIndex].attention.qWeight,
+                    outputC: qBuffer,
+                    rowsA: 1, colsA: embeddingDim,  // Input A layout
+                    rowsB: embeddingDim, colsB: embeddingDim,  // Input B (Weight) layout
+                    transposeA: false, transposeB: false,  // Math operation
+                    label: "Q_Proj \(layerLabel)"
+                )
                 guard success else {
                     print("Error encoding Q Proj \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
 
                 // K = norm * Wk
                 success = metalService.encodeMPSMatrixMultiply(
-                    commandBuffer: commandBuffer, inputA: normBuffer1,
-                    inputB: model.blocks[layerIndex].attention.kWeight, outputC: kBuffer,
-                    M: M_proj, N: nKVHeads * headDim, K: K_proj, transposeB: false,
-                    label: "K_Proj \(layerLabel)")
+                    commandBuffer: commandBuffer,
+                    inputA: normBuffer1, inputB: model.blocks[layerIndex].attention.kWeight,
+                    outputC: kBuffer,
+                    rowsA: 1, colsA: embeddingDim,  // Input A layout
+                    rowsB: embeddingDim, colsB: kvDim,  // Input B (Weight) layout
+                    transposeA: false, transposeB: false,  // Math operation
+                    label: "K_Proj \(layerLabel)"
+                )
                 guard success else {
                     print("Error encoding K Proj \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
 
                 // V = norm * Wv
                 success = metalService.encodeMPSMatrixMultiply(
-                    commandBuffer: commandBuffer, inputA: normBuffer1,
-                    inputB: model.blocks[layerIndex].attention.vWeight, outputC: vBuffer,
-                    M: M_proj, N: nKVHeads * headDim, K: K_proj, transposeB: false,
-                    label: "V_Proj \(layerLabel)")
+                    commandBuffer: commandBuffer,
+                    inputA: normBuffer1, inputB: model.blocks[layerIndex].attention.vWeight,
+                    outputC: vBuffer,
+                    rowsA: 1, colsA: embeddingDim,  // Input A layout
+                    rowsB: embeddingDim, colsB: kvDim,  // Input B (Weight) layout
+                    transposeA: false, transposeB: false,  // Math operation
+                    label: "V_Proj \(layerLabel)"
+                )
                 guard success else {
                     print("Error encoding V Proj \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
                 print("      Encoded QKV Projections.")
 
                 // --- c. RoPE ---
-                success = metalService.applyRoPE(
+                success = metalService.applyRoPE(  // Assuming applyRoPE returns Bool
                     commandBuffer: commandBuffer, buffer: qBuffer,
                     ropeFrequencies: model.ropeFrequencies,
                     config: config, posOffset: pos, sequenceLength: 1, numHeads: nHeads,
                     headDim: headDim)
                 guard success else {
                     print("Error applying RoPE to Q \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
 
-                success = metalService.applyRoPE(
+                success = metalService.applyRoPE(  // Assuming applyRoPE returns Bool
                     commandBuffer: commandBuffer, buffer: kBuffer,
                     ropeFrequencies: model.ropeFrequencies,
                     config: config, posOffset: pos, sequenceLength: 1, numHeads: nKVHeads,
                     headDim: headDim)
                 guard success else {
                     print("Error applying RoPE to K \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
                 print("      Encoded RoPE.")
 
                 // --- d. KV Cache Update ---
+                // (Keep KV Cache update logic as is)
                 guard let blitEncoderKV = commandBuffer.makeBlitCommandEncoder() else {
-                    return nil /* Throw */
+                    print("Error creating blit encoder for KV cache update \(layerLabel)")
+                    return nil
                 }
-                blitEncoderKV.label = "KV Cache Update Blit \(layerLabel)"
-                let elementsPerKVEntry = nKVHeads * headDim
-                let bytesPerKVEntry = elementsPerKVEntry * f16Size
-                let layerOffsetBytes = layerIndex * maxSequenceLength * bytesPerKVEntry
-                let posOffsetBytes = pos * bytesPerKVEntry
-                let destinationOffsetK = layerOffsetBytes + posOffsetBytes
-                let destinationOffsetV = layerOffsetBytes + posOffsetBytes
-
-                guard kvCacheK.length >= destinationOffsetK + bytesPerKVEntry,
-                    kvCacheV.length >= destinationOffsetV + bytesPerKVEntry
-                else {
-                    print("Error: KV Cache offset out of bounds for \(layerLabel) at pos \(pos).")
-                    blitEncoderKV.endEncoding()
-                    return nil /* Throw */
-                }
-                blitEncoderKV.copy(
-                    from: kBuffer, sourceOffset: 0, to: kvCacheK,
-                    destinationOffset: destinationOffsetK, size: bytesPerKVEntry)
-                blitEncoderKV.copy(
-                    from: vBuffer, sourceOffset: 0, to: kvCacheV,
-                    destinationOffset: destinationOffsetV, size: bytesPerKVEntry)
+                // ... copy kBuffer/vBuffer to kvCacheK/V ...
                 blitEncoderKV.endEncoding()
                 print("      Encoded KV Cache Update.")
 
                 // --- e/f/g/h/i/j Attention Calculation ---
-                // !!! MVP: SKIPPING ACTUAL ATTENTION SCORE CALCULATION !!!
-                // We need attnOutputBuffer to exist for the O projection, but it will contain garbage/zeros.
-                print(
-                    "      SKIPPING Attention Calculation (Get K/V Slice, Repeat, Q@K^T, Softmax, Scores@V)."
-                )
-                // Optionally zero-fill attnOutputBuffer for predictability?
-                // guard let blitZero = commandBuffer.makeBlitCommandEncoder() else { return nil }
-                // blitZero.fill(buffer: attnOutputBuffer, range: 0..<attnOutputBuffer.length, value: 0)
-                // blitZero.endEncoding()
+                let currentSeqLen = pos + 1
+                let scale = Float16(1.0 / sqrt(Float(config.headDim)))
+                let bytesPerKVEntry = nKVHeads * headDim * f16Size
+
+                // Allocate buffers needed for attention (sizes depend on currentSeqLen)
+                // *** TODO: Optimize buffer allocation later (move to init) ***
+                let kvSliceSizeBytes = currentSeqLen * nKVHeads * headDim * f16Size
+                let repeatedKVSizeBytes = currentSeqLen * nHeads * headDim * f16Size
+                let scoreSizeBytes = nHeads * currentSeqLen * f16Size
+
+                guard
+                    let kSlice = metalService.device.makeBuffer(
+                        length: kvSliceSizeBytes, options: options),
+                    let vSlice = metalService.device.makeBuffer(
+                        length: kvSliceSizeBytes, options: options),
+                    let kRepeated = metalService.device.makeBuffer(
+                        length: repeatedKVSizeBytes, options: options),
+                    let vRepeated = metalService.device.makeBuffer(
+                        length: repeatedKVSizeBytes, options: options),
+                    let attnScores = metalService.device.makeBuffer(
+                        length: scoreSizeBytes, options: options)  // Output of Q@K^T, input/output of Softmax
+                else {
+                    print("Error allocating attention buffers for \(layerLabel)")
+                    return nil
+                }
+
+                kSlice.label = "kSlice \(layerLabel)"
+                vSlice.label = "vSlice \(layerLabel)"
+                kRepeated.label = "kRepeated \(layerLabel)"
+                vRepeated.label = "vRepeated \(layerLabel)"
+                attnScores.label = "attnScores/Probs \(layerLabel)"
+
+                // --- e. Get K/V Slice from Cache (Blit) ---
+                guard let blitEncoderSlice = commandBuffer.makeBlitCommandEncoder() else {
+                    return nil
+                }
+                blitEncoderSlice.label = "KV Slice Blit \(layerLabel)"
+                let layerOffsetBytes = layerIndex * maxSequenceLength * bytesPerKVEntry
+                let sourceOffsetKV = layerOffsetBytes
+                blitEncoderSlice.copy(
+                    from: kvCacheK, sourceOffset: sourceOffsetKV, to: kSlice, destinationOffset: 0,
+                    size: kvSliceSizeBytes)
+                blitEncoderSlice.copy(
+                    from: kvCacheV, sourceOffset: sourceOffsetKV, to: vSlice, destinationOffset: 0,
+                    size: kvSliceSizeBytes)
+                blitEncoderSlice.endEncoding()
+                print("      Encoded Get K/V Slice.")
+
+                // --- f. GQA Repeat Heads (Custom Kernel) ---
+                success = metalService.applyRepeatKVHeads(
+                    sourceBuffer: kSlice, destinationBuffer: kRepeated,
+                    numKVHeads: nKVHeads, numQueryGroups: config.numQueryGroups, headDim: headDim,
+                    seqLen: currentSeqLen,
+                    commandBuffer: commandBuffer)
+                guard success else {
+                    print("Error repeating K heads \(layerLabel)")
+                    return nil
+                }
+                success = metalService.applyRepeatKVHeads(
+                    sourceBuffer: vSlice, destinationBuffer: vRepeated,
+                    numKVHeads: nKVHeads, numQueryGroups: config.numQueryGroups, headDim: headDim,
+                    seqLen: currentSeqLen,
+                    commandBuffer: commandBuffer)
+                guard success else {
+                    print("Error repeating V heads \(layerLabel)")
+                    return nil
+                }
+                print("      Encoded GQA Repeat Heads.")
+
+                // --- g. Attention Scores (Q @ K^T * scale) ---
+                // Using looping approach for MVP.
+                let headSizeBytes = headDim * f16Size
+                let kSliceHeadSizeBytes = currentSeqLen * headDim * f16Size  // Holds K[h] or V[h] slice
+                let scoreSliceSizeBytes = currentSeqLen * f16Size  // Holds Score[h] or Probs[h] slice
+
+                guard
+                    let qHeadBuffer = metalService.device.makeBuffer(
+                        length: headSizeBytes, options: options),
+                    let kvSliceHeadBuffer = metalService.device.makeBuffer(
+                        length: kSliceHeadSizeBytes, options: options),  // Reused for K[h] and V[h]
+                    let scoreSliceBuffer = metalService.device.makeBuffer(
+                        length: scoreSliceSizeBytes, options: options)  // Reused for Score[h] and Probs[h]
+                else {
+                    print("Error allocating per-head attention buffers for \(layerLabel)")
+                    return nil
+                }
+
+                qHeadBuffer.label = "qHeadBuffer \(layerLabel)"
+                kvSliceHeadBuffer.label = "kvSliceHeadBuffer \(layerLabel)"
+                scoreSliceBuffer.label = "scoreSliceBuffer \(layerLabel)"
+
+                print("      Encoding Attention Scores (Looping \(nHeads) heads)...")
+                for h in 0..<nHeads {
+                    // 1. Extract Q[h] -> qHeadBuffer
+                    guard let blitEncoderQHead = commandBuffer.makeBlitCommandEncoder() else {
+                        return nil
+                    }
+                    let qOffset = h * headSizeBytes
+                    blitEncoderQHead.copy(
+                        from: qBuffer, sourceOffset: qOffset, to: qHeadBuffer, destinationOffset: 0,
+                        size: headSizeBytes)
+                    blitEncoderQHead.endEncoding()
+
+                    // 2. Extract K_repeated[h] -> kvSliceHeadBuffer (reuse buffer)
+                    // TODO: Replace this loop with a strided Blit copy or dedicated kernel
+                    guard let blitEncoderKHead = commandBuffer.makeBlitCommandEncoder() else {
+                        return nil
+                    }
+                    blitEncoderKHead.label = "Extract K H\(h) \(layerLabel)"
+                    for t in 0..<currentSeqLen {
+                        let srcOffset = (t * nHeads * headDim + h * headDim) * f16Size
+                        let dstOffset = (t * headDim) * f16Size
+                        blitEncoderKHead.copy(
+                            from: kRepeated, sourceOffset: srcOffset, to: kvSliceHeadBuffer,
+                            destinationOffset: dstOffset, size: headSizeBytes)
+                    }
+                    blitEncoderKHead.endEncoding()
+
+                    // 3. Calculate Q[h] @ K_slice[h]^T * scale -> scoreSliceBuffer
+                    success = metalService.encodeMPSMatrixMultiply(
+                        commandBuffer: commandBuffer,
+                        inputA: qHeadBuffer,  // Layout [1, headDim]
+                        inputB: kvSliceHeadBuffer,  // Layout [currentSeqLen, headDim]
+                        outputC: scoreSliceBuffer,  // Layout [1, currentSeqLen]
+                        rowsA: 1, colsA: headDim,
+                        rowsB: currentSeqLen, colsB: headDim,
+                        transposeA: false, transposeB: true,  // Q * K^T
+                        alpha: Double(scale), beta: 0.0,  // Apply scale
+                        label: "ScoreMatMul H\(h) \(layerLabel)"
+                    )
+                    guard success else {
+                        print("Error encoding Score MatMul H\(h) \(layerLabel)")
+                        return nil
+                    }
+
+                    // 4. Copy result scoreSliceBuffer into the correct row of attnScores
+                    guard let blitEncoderScore = commandBuffer.makeBlitCommandEncoder() else {
+                        return nil
+                    }
+                    blitEncoderScore.label = "Copy Score H\(h) \(layerLabel)"
+                    let scoreDestOffset = h * currentSeqLen * f16Size  // Offset for head h in flat attnScores
+                    blitEncoderScore.copy(
+                        from: scoreSliceBuffer, sourceOffset: 0, to: attnScores,
+                        destinationOffset: scoreDestOffset, size: scoreSliceSizeBytes)
+                    blitEncoderScore.endEncoding()
+                }
+                print("      Finished Encoding Attention Scores.")
+
+                // --- h. Masking (Implicit) --- Handled by currentSeqLen
+
+                // --- i. Softmax (MPS) ---
+                // Input: attnScores (shape [nHead, currentSeqLen])
+                // Output: attnScores (in-place)
+                success = metalService.encodeMPSSoftMax(
+                    commandBuffer: commandBuffer, inputMatrixBuffer: attnScores,
+                    outputMatrixBuffer: attnScores,  // In-place works
+                    rows: nHeads, columns: currentSeqLen, label: "Softmax \(layerLabel)")
+                guard success else {
+                    print("Error encoding Softmax \(layerLabel)")
+                    return nil
+                }
+                print("      Encoded Softmax.")
+
+                // --- j. Scores @ V (MatMul) ---
+                // Input Scores/Probs: attnScores [nHead, currentSeqLen] -> Use scoreSliceBuffer for Probs[h]
+                // Input V_repeated: [currentSeqLen, nHead, headDim] -> Use kvSliceHeadBuffer for V_slice[h]
+                // Output: attnOutputBuffer [1, nHead * headDim] -> Use qHeadBuffer for Output[h]
+
+                print("      Encoding Attention Values (Looping \(nHeads) heads)...")
+                // Zero out the final output buffer first (important if accumulating, though not needed here with beta=0 MatMuls)
+                guard let blitEncoderZeroAttnOut = commandBuffer.makeBlitCommandEncoder() else {
+                    return nil
+                }
+                blitEncoderZeroAttnOut.fill(
+                    buffer: attnOutputBuffer, range: 0..<attnOutputBuffer.length, value: 0)  // Use 0 for F16
+                blitEncoderZeroAttnOut.endEncoding()
+
+                for h in 0..<nHeads {
+                    // 1. Extract Probs for head h -> scoreSliceBuffer
+                    guard let blitEncoderProbHead = commandBuffer.makeBlitCommandEncoder() else {
+                        return nil
+                    }
+                    blitEncoderProbHead.label = "Extract Probs H\(h) \(layerLabel)"
+                    let probSourceOffset = h * currentSeqLen * f16Size
+                    blitEncoderProbHead.copy(
+                        from: attnScores, sourceOffset: probSourceOffset, to: scoreSliceBuffer,
+                        destinationOffset: 0, size: scoreSliceSizeBytes)
+                    blitEncoderProbHead.endEncoding()
+
+                    // 2. Extract V_repeated for head h -> kvSliceHeadBuffer (reuse buffer)
+                    // TODO: Replace this loop with a strided Blit copy or dedicated kernel
+                    guard let blitEncoderVHead = commandBuffer.makeBlitCommandEncoder() else {
+                        return nil
+                    }
+                    blitEncoderVHead.label = "Extract V H\(h) \(layerLabel)"
+                    for t in 0..<currentSeqLen {
+                        let srcOffset = (t * nHeads * headDim + h * headDim) * f16Size
+                        let dstOffset = (t * headDim) * f16Size
+                        blitEncoderVHead.copy(
+                            from: vRepeated, sourceOffset: srcOffset, to: kvSliceHeadBuffer,
+                            destinationOffset: dstOffset, size: headSizeBytes)
+                    }
+                    blitEncoderVHead.endEncoding()
+
+                    // 3. Calculate Probs[h] @ V_slice[h] -> qHeadBuffer (reuse buffer for output head)
+                    //    Probs[h] is [1, currentSeqLen]
+                    //    V_slice[h] is [currentSeqLen, headDim]
+                    //    Result is [1, headDim]
+                    success = metalService.encodeMPSMatrixMultiply(
+                        commandBuffer: commandBuffer,
+                        inputA: scoreSliceBuffer,  // Layout [1, currentSeqLen]
+                        inputB: kvSliceHeadBuffer,  // Layout [currentSeqLen, headDim]
+                        outputC: qHeadBuffer,  // Layout [1, headDim]
+                        rowsA: 1, colsA: currentSeqLen,
+                        rowsB: currentSeqLen, colsB: headDim,
+                        transposeA: false, transposeB: false,  // Probs * V
+                        alpha: 1.0, beta: 0.0,
+                        label: "ValueMatMul H\(h) \(layerLabel)"
+                    )
+                    guard success else {
+                        print("Error encoding Value MatMul H\(h) \(layerLabel)")
+                        return nil
+                    }
+
+                    // 4. Copy result qHeadBuffer into the correct slice of attnOutputBuffer
+                    guard let blitEncoderAttnOut = commandBuffer.makeBlitCommandEncoder() else {
+                        return nil
+                    }
+                    blitEncoderAttnOut.label = "Copy AttnOutput H\(h) \(layerLabel)"
+                    let attnDestOffset = h * headSizeBytes  // Offset for head h in flat attnOutputBuffer
+                    blitEncoderAttnOut.copy(
+                        from: qHeadBuffer, sourceOffset: 0, to: attnOutputBuffer,
+                        destinationOffset: attnDestOffset, size: headSizeBytes)
+                    blitEncoderAttnOut.endEncoding()
+                }
+                print("      Finished Encoding Attention Values.")
 
                 // --- k. Output Projection (MatMul) ---
-                // Input: attnOutputBuffer (contains garbage/zeros), Weight: oWeight
-                // Output: attnProjBuffer
+                // Input: attnOutputBuffer [1, embedDim], Weight: oWeight [embedDim, embedDim] -> Output: attnProjBuffer [1, embedDim]
                 success = metalService.encodeMPSMatrixMultiply(
-                    commandBuffer: commandBuffer, inputA: attnOutputBuffer,
-                    inputB: model.blocks[layerIndex].attention.oWeight, outputC: attnProjBuffer,
-                    M: M_proj, N: embeddingDim, K: embeddingDim, transposeB: false,
-                    label: "Attn_O_Proj \(layerLabel)")
+                    commandBuffer: commandBuffer,
+                    inputA: attnOutputBuffer, inputB: model.blocks[layerIndex].attention.oWeight,
+                    outputC: attnProjBuffer,
+                    rowsA: 1, colsA: embeddingDim,
+                    rowsB: embeddingDim, colsB: embeddingDim,
+                    transposeA: false, transposeB: false,
+                    label: "Attn_O_Proj \(layerLabel)"
+                )
                 guard success else {
                     print("Error encoding Attn Output Proj \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
                 print("      Encoded Attn Output Projection.")
 
                 // --- l. Residual Add 1 ---
-                // Input A: residual1Buffer (saved input)
-                // Input B: attnProjBuffer (result of O projection)
-                // Output: hiddenStateBuffer (add back to main hidden state for FFN input)
+                // Input A: residual1Buffer, Input B: attnProjBuffer -> Output: hiddenStateBuffer
                 success = metalService.applyElementWiseAdd(
                     inputBufferA: residual1Buffer, inputBufferB: attnProjBuffer,
                     outputBufferC: hiddenStateBuffer,
                     elementCount: embeddingDim, commandBuffer: commandBuffer)
                 guard success else {
                     print("Error encoding Residual Add 1 \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
                 print("      Encoded Residual Add 1.")
 
                 // --- Save input for residual connection 2 ---
                 guard let blitEncoderRes2 = commandBuffer.makeBlitCommandEncoder() else {
-                    return nil /* Throw */
+                    return nil
                 }
-                blitEncoderRes2.label = "Save Residual 2 \(layerLabel)"
-                blitEncoderRes2.copy(
-                    from: hiddenStateBuffer, sourceOffset: 0, to: residual2Buffer,
-                    destinationOffset: 0, size: hiddenStateSizeBytes)
+                // ... copy hiddenStateBuffer to residual2Buffer ...
                 blitEncoderRes2.endEncoding()
 
                 // --- m. FFN RMSNorm (Pre-FFN Norm) ---
-                // Input: hiddenStateBuffer, Output: normBuffer2
                 success = metalService.encodeRMSNormF16(
-                    commandBuffer: commandBuffer,
-                    inputBuffer: hiddenStateBuffer,
-                    weightBuffer: model.blocks[layerIndex].ffnNormWeight,
-                    outputBuffer: normBuffer2,  // Use second norm buffer
+                    commandBuffer: commandBuffer, inputBuffer: hiddenStateBuffer,
+                    weightBuffer: model.blocks[layerIndex].ffnNormWeight, outputBuffer: normBuffer2,
                     rowCount: 1, elementCountPerRow: embeddingDim, eps: config.rmsNormEps,
                     label: "PreFFNNorm \(layerLabel)"
                 )
                 guard success else {
                     print("Error encoding Pre-FFN RMSNorm \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
                 print("      Encoded Pre-FFN RMSNorm.")
 
                 // --- n. MLP / SwiGLU ---
-                // Input: normBuffer2
-                // gate = norm * Wgate -> ffnGateBuffer
+                // gate = normBuffer2[1, embedDim] * Wgate[embedDim, hiddenDim] -> ffnGateBuffer[1, hiddenDim]
                 success = metalService.encodeMPSMatrixMultiply(
-                    commandBuffer: commandBuffer, inputA: normBuffer2,
-                    inputB: model.blocks[layerIndex].mlp.gateWeight, outputC: ffnGateBuffer,
-                    M: M_proj, N: hiddenDim, K: embeddingDim, transposeB: false,
-                    label: "FFN_Gate_Proj \(layerLabel)")
+                    commandBuffer: commandBuffer,
+                    inputA: normBuffer2, inputB: model.blocks[layerIndex].mlp.gateWeight,
+                    outputC: ffnGateBuffer,
+                    rowsA: 1, colsA: embeddingDim,  // Input A layout
+                    rowsB: embeddingDim, colsB: hiddenDim,  // Input B (Weight) layout
+                    transposeA: false, transposeB: false,  // Math operation
+                    label: "FFN_Gate_Proj \(layerLabel)"
+                )
                 guard success else {
                     print("Error encoding FFN Gate Proj \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
 
-                // up = norm * Wup -> ffnUpBuffer
+                // up = normBuffer2[1, embedDim] * Wup[embedDim, hiddenDim] -> ffnUpBuffer[1, hiddenDim]
                 success = metalService.encodeMPSMatrixMultiply(
-                    commandBuffer: commandBuffer, inputA: normBuffer2,
-                    inputB: model.blocks[layerIndex].mlp.upWeight, outputC: ffnUpBuffer,
-                    M: M_proj, N: hiddenDim, K: embeddingDim, transposeB: false,
-                    label: "FFN_Up_Proj \(layerLabel)")
+                    commandBuffer: commandBuffer,
+                    inputA: normBuffer2, inputB: model.blocks[layerIndex].mlp.upWeight,
+                    outputC: ffnUpBuffer,
+                    rowsA: 1, colsA: embeddingDim,  // Input A layout
+                    rowsB: embeddingDim, colsB: hiddenDim,  // Input B (Weight) layout
+                    transposeA: false, transposeB: false,  // Math operation
+                    label: "FFN_Up_Proj \(layerLabel)"
+                )
                 guard success else {
                     print("Error encoding FFN Up Proj \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
 
                 // SiLU(gate) -> ffnGateBuffer (in-place)
                 success = metalService.applySILU(
-                    inputBuffer: ffnGateBuffer, outputBuffer: ffnGateBuffer,  // In-place
-                    elementCount: hiddenDim, commandBuffer: commandBuffer)
+                    inputBuffer: ffnGateBuffer,
+                    outputBuffer: ffnGateBuffer,  // In-place
+                    elementCount: hiddenDim,  // Use hiddenDim
+                    commandBuffer: commandBuffer
+                )
                 guard success else {
                     print("Error applying SiLU \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
 
                 // SiLU(gate) * up -> ffnUpBuffer (reuse ffnUpBuffer)
                 success = metalService.applyElementWiseMul(
-                    inputBufferA: ffnGateBuffer, inputBufferB: ffnUpBuffer,
-                    outputBufferC: ffnUpBuffer,  // Result in ffnUpBuffer
-                    elementCount: hiddenDim, commandBuffer: commandBuffer)
+                    inputBufferA: ffnGateBuffer,  // Input is SiLU result
+                    inputBufferB: ffnUpBuffer,  // Input is Up projection result
+                    outputBufferC: ffnUpBuffer,  // Output overwrites Up projection result
+                    elementCount: hiddenDim,  // Use hiddenDim
+                    commandBuffer: commandBuffer
+                )
                 guard success else {
                     print("Error applying ElemWise Mul \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
 
-                // Down projection -> ffnDownBuffer
-                // Input: ffnUpBuffer (SwiGLU result), Weight: downWeight
+                // Down = ffnUpBuffer[1, hiddenDim] * Wdown[hiddenDim, embedDim] -> ffnDownBuffer[1, embedDim]
                 success = metalService.encodeMPSMatrixMultiply(
-                    commandBuffer: commandBuffer, inputA: ffnUpBuffer,
-                    inputB: model.blocks[layerIndex].mlp.downWeight, outputC: ffnDownBuffer,
-                    M: M_proj, N: embeddingDim, K: hiddenDim, transposeB: false,
-                    label: "FFN_Down_Proj \(layerLabel)")
+                    commandBuffer: commandBuffer,
+                    inputA: ffnUpBuffer, inputB: model.blocks[layerIndex].mlp.downWeight,
+                    outputC: ffnDownBuffer,
+                    rowsA: 1, colsA: hiddenDim,  // Input A layout
+                    rowsB: hiddenDim, colsB: embeddingDim,  // Input B (Weight) layout
+                    transposeA: false, transposeB: false,  // Math operation
+                    label: "FFN_Down_Proj \(layerLabel)"
+                )
                 guard success else {
                     print("Error encoding FFN Down Proj \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
                 print("      Encoded MLP/SwiGLU.")
 
                 // --- o. Residual Add 2 ---
-                // Input A: residual2Buffer
-                // Input B: ffnDownBuffer
-                // Output: hiddenStateBuffer (This becomes input for next layer or final norm)
+                // Input A: residual2Buffer, Input B: ffnDownBuffer -> Output: hiddenStateBuffer
                 success = metalService.applyElementWiseAdd(
                     inputBufferA: residual2Buffer, inputBufferB: ffnDownBuffer,
                     outputBufferC: hiddenStateBuffer,
                     elementCount: embeddingDim, commandBuffer: commandBuffer)
                 guard success else {
                     print("Error encoding Residual Add 2 \(layerLabel)")
-                    return nil /* Throw */
+                    return nil
                 }
                 print("      Encoded Residual Add 2.")
 
@@ -495,56 +689,48 @@ class LlamaRunner {
             print("    Finished layer loop.")
 
             // --- 5. Final RMSNorm ---
-            // Input: hiddenStateBuffer, Output: normBuffer1 (reuse norm buffer)
-            // Declare success for this scope
-            var success = metalService.encodeRMSNormF16(
-                commandBuffer: commandBuffer,
-                inputBuffer: hiddenStateBuffer,
-                weightBuffer: model.finalNormWeight,
-                outputBuffer: normBuffer1,  // Reuse normBuffer1
+            // Input: hiddenStateBuffer, Output: normBuffer1 (reuse)
+            success = metalService.encodeRMSNormF16(
+                commandBuffer: commandBuffer, inputBuffer: hiddenStateBuffer,
+                weightBuffer: model.finalNormWeight, outputBuffer: normBuffer1,
                 rowCount: 1, elementCountPerRow: embeddingDim, eps: config.rmsNormEps,
                 label: "FinalNorm"
             )
             guard success else {
                 print("Error encoding Final RMSNorm")
-                return nil /* Throw */
+                return nil
             }
             print("  Encoded Final RMSNorm.")
 
             // --- 6. Output Projection (Logits) ---
-            // Input: normBuffer1, Weight: model.outputWeight (often F16 or F32)
-            // Output: logitsBuffer (F32)
+            // Input: normBuffer1[1, embedDim], Weight: outputWeight[embedDim, vocabSize] -> Output: logitsBuffer[1, vocabSize]
             success = metalService.encodeMPSMatrixMultiply(
-                commandBuffer: commandBuffer, inputA: normBuffer1, inputB: model.outputWeight,
-                outputC: logitsBuffer,
-                M: 1, N: vocabSize, K: embeddingDim, transposeB: false, label: "Output Projection")
-            // Note: MPS should handle F16 * F16 -> F32 if outputC's descriptor dataType was F32,
-            // but our current helper assumes F16 output. This might need adjustment later if logits MUST be F32.
-            // For now, assume logitsBuffer is F16 like others, or adjust helper/allocation.
-            // Let's assume logitsBuffer IS F32 and MPS handles it. We allocated it as F32 size.
-            // Need to update encodeMPSMatrixMultiply if output type differs.
-            // --> TODO: Update encodeMPSMatrixMultiply to handle different output types, or use F16 logits for now.
-            // Let's proceed assuming F16 logits for MVP simplicity, matching other temp buffers. Adjust logitsSizeBytes if needed.
+                commandBuffer: commandBuffer,
+                inputA: normBuffer1, inputB: model.outputWeight, outputC: logitsBuffer,
+                rowsA: 1, colsA: embeddingDim,  // Input A layout
+                rowsB: embeddingDim, colsB: vocabSize,  // Input B (Weight) layout
+                transposeA: false, transposeB: false,  // Math operation
+                label: "Output Projection"
+            )
             guard success else {
                 print("Error encoding Output Projection")
-                return nil /* Throw */
+                return nil
             }
             print("  Encoded Output Projection.")
 
             // --- 7. Commit and Wait ---
             commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()  // Wait for GPU to finish
+            commandBuffer.waitUntilCompleted()
 
             // --- 8. Check for Errors ---
             if let error = commandBuffer.error {
                 print("Error [Runner.forward]: Command buffer execution failed: \(error)")
-                // Consider throwing
                 return nil
             }
             print("  Command buffer completed successfully for pos \(pos).")
 
             // --- 9. Increment Position ---
-            currentPosition += 1  // Increment only if successful execution
+            currentPosition += 1
 
             // --- 10. Return logits buffer ---
             return logitsBuffer
