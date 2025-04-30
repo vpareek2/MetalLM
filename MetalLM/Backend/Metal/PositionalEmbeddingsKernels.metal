@@ -9,31 +9,35 @@ using namespace metal;
 // RoPE Kernel Arguments
 //------------------------------------------------------------------------------
 
-// Argument struct mirroring ggml_metal_kargs_rope, adapted for our kernel
-struct MetalRopeArgs {
-    // Dimensions
-    uint n_dims            [[align(4)]]; // Align uint (4 bytes)
+// Corrected: Apply alignment attribute to the struct type declaration
+struct [[metal::aligned(4)]] MetalRopeArgs { // <-- CORRECT placement for struct alignment
+                                           // using metal::aligned is often more explicit in MSL
 
-    // RoPE Parameters
-    float freq_base        [[align(4)]]; // Align float (4 bytes)
-    float freq_scale       [[align(4)]];
-    int   pos_offset       [[align(4)]]; // Align int (4 bytes)
+    // Dimensions (Natural alignment is 4 bytes)
+    uint n_dims;
 
-    // YaRN Parameters
-    int   n_ctx_orig       [[align(4)]];
-    float ext_factor       [[align(4)]];
-    float attn_factor      [[align(4)]];
-    float beta_fast        [[align(4)]];
-    float beta_slow        [[align(4)]];
+    // RoPE Parameters (Natural alignment is 4 bytes)
+    float freq_base;
+    float freq_scale;
+    int   pos_offset;
 
-    // Flag
-    bool has_freq_factors  [[align(1)]]; // bool is 1 byte
+    // YaRN Parameters (Natural alignment is 4 bytes)
+    int   n_ctx_orig;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
 
-    // Add explicit padding to reach the expected size (40 bytes)
-    // We have 9 * 4 bytes + 1 byte = 37 bytes. Need 3 padding bytes.
-    uint8_t _padding[3]    [[align(1)]];
+    // Flag (Natural alignment is 1 byte)
+    bool has_freq_factors;
 
-} [[align(4)]]; // Ensure overall struct alignment is at least 4 bytes
+    // Add explicit padding to ensure total size is 40 bytes, matching Swift's MemoryLayout expectation.
+    // Size before padding: 9 * 4 bytes (uint/float/int) + 1 byte (bool) = 37 bytes.
+    // The compiler might add padding automatically based on the struct alignment,
+    // but explicit padding makes the size definite.
+    uint8_t _padding[3];
+
+};
 
 
 //------------------------------------------------------------------------------
