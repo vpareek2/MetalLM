@@ -620,24 +620,22 @@ class MetalService {
         args.beta_slow = config.ropeScalingBetaSlow
         args.has_freq_factors = (ropeFrequencies != nil)
 
-        // --- FIX: Use MemoryLayout size (should be 40) ---
-        // Remove the manual calculation:
-        // let metalArgsSize = ... (DELETE or COMMENT OUT)
+        // --- Use STRIDE ---
+        let swiftStructStride = MemoryLayout<MetalRopeArgs>.stride  // Use stride (should be 40)
 
         print(
-            "DEBUG: Swift MetalRopeArgs size = \(MemoryLayout<MetalRopeArgs>.size), stride = \(MemoryLayout<MetalRopeArgs>.stride)"
+            "DEBUG: Swift MetalRopeArgs size = \(MemoryLayout<MetalRopeArgs>.size), stride = \(swiftStructStride)"
         )
+        print("DEBUG: Creating args buffer with size = \(swiftStructStride)")  // Should print 40
 
-        // Create args buffer using the Swift struct's memory layout size
+        // Create args buffer using the Swift struct's stride
         guard
             let argsBuffer = device.makeBuffer(
                 bytes: &args,
-                length: MemoryLayout<MetalRopeArgs>.size,  // <-- Use MemoryLayout directly
+                length: swiftStructStride,  // <-- USE STRIDE (should be 40)
                 options: .storageModeShared)
         else {
-            print(
-                "Error [RoPE]: Failed to create args buffer with size \(MemoryLayout<MetalRopeArgs>.size)."
-            )
+            print("Error [RoPE]: Failed to create args buffer with size \(swiftStructStride).")
             return false
         }
         // --- END FIX ---

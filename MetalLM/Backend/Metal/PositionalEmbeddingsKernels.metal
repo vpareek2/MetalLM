@@ -12,31 +12,28 @@ using namespace metal;
 // Argument struct mirroring ggml_metal_kargs_rope, adapted for our kernel
 struct MetalRopeArgs {
     // Dimensions
-    // ne0: Not strictly needed if dispatch covers exact dims to rotate?
-    uint n_dims; // Number of dimensions to actually rotate (config.ropeDimensionCount)
+    uint n_dims            [[align(4)]]; // Align uint (4 bytes)
 
     // RoPE Parameters
-    float freq_base;
-    float freq_scale; // Linear scaling factor (often 1.0 if YaRN is used)
-    // Mode (0=norm, 1=neox) - We assume 0 for kernel_rope_norm below
-    // int   p_type;
-
-    // Position Input
-    int   pos_offset; // Starting position for this calculation
+    float freq_base        [[align(4)]]; // Align float (4 bytes)
+    float freq_scale       [[align(4)]];
+    int   pos_offset       [[align(4)]]; // Align int (4 bytes)
 
     // YaRN Parameters
-    int   n_ctx_orig;   // Original context length
-    float ext_factor;   // Extrapolation factor (often 0.0 if not extending)
-    float attn_factor;  // Attention scaling factor (sometimes modified by YaRN)
-    float beta_fast;
-    float beta_slow;
+    int   n_ctx_orig       [[align(4)]];
+    float ext_factor       [[align(4)]];
+    float attn_factor      [[align(4)]];
+    float beta_fast        [[align(4)]];
+    float beta_slow        [[align(4)]];
 
-    // Added flag to indicate if freq factors buffer is present
-    bool has_freq_factors;
+    // Flag
+    bool has_freq_factors  [[align(1)]]; // bool is 1 byte
 
-    // Strides might be needed if layout is complex, but let's try without first
-    // uint nb0; uint nb1; uint nb2;
-};
+    // Add explicit padding to reach the expected size (40 bytes)
+    // We have 9 * 4 bytes + 1 byte = 37 bytes. Need 3 padding bytes.
+    uint8_t _padding[3]    [[align(1)]];
+
+} [[align(4)]]; // Ensure overall struct alignment is at least 4 bytes
 
 
 //------------------------------------------------------------------------------
@@ -133,11 +130,10 @@ static void calculate_rope_yarn(
 //------------------------------------------------------------------------------
 kernel void kernel_rope_f16_inplace(
     constant MetalRopeArgs   & args  [[buffer(0)]],
-    device   half            * data  [[buffer(1)]], // Input/Output Q or K
-    device const float       * freqs [[buffer(2)]], // Optional freq factors
-    // --- REVERTED Grid/Thread IDs ---
-    uint3 tid  [[thread_position_in_grid]], // Use vector for position
-    uint3 gdim [[threads_per_grid]]         // Keep grid dimensions
+    device   half            * data  [[buffer(1)]],
+    device const float       * freqs [[buffer(2)]],
+    uint3 tid  [[thread_position_in_grid]],
+    uint3 gdim [[threads_per_grid]]
 ) {
 
     // Map thread ID vector components to dimensions
