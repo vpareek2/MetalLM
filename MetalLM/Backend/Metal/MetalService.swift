@@ -33,6 +33,17 @@ struct MetalRopeArgs {
     // Strides removed for now, assuming kernel calculates offsets
 }
 
+/// Mirrors the RepeatKVHeadsArgs struct in AttentionKernels.metal
+struct RepeatKVHeadsArgs {
+    let num_kv_heads: UInt32     // Use fixed-size types matching Metal's uint
+    let num_query_groups: UInt32
+    let head_dim: UInt32
+    let seq_len: UInt32          // Sequence length being processed
+
+    // Ensure layout matches Metal struct if needed, though for simple types it's usually fine.
+    // Swift automatically handles padding/alignment for these basic types to match Metal.
+}
+
 // Service class to manage Metal device, command queue, and compute pipelines
 class MetalService {
 
@@ -50,6 +61,7 @@ class MetalService {
     let siluF16PipelineState: MTLComputePipelineState
     let mulF16PipelineState: MTLComputePipelineState
     let addF16PipelineState: MTLComputePipelineState
+    let repeatKVHeadsPipelineState: MTLComputePipelineState
 
     static let shared = MetalService()
 
@@ -131,6 +143,9 @@ class MetalService {
             
             self.addF16PipelineState = try makePipeline(functionName: "kernel_add_f16")
             print("Pipeline state created for kernel_add_f16")
+            
+            self.repeatKVHeadsPipelineState = try makePipeline(functionName: "kernel_repeat_kv_heads_f16")
+            print("Pipeline state created for kernel_repeat_kv_heads_f16")
 
         } catch let error as MetalServiceError {
             // Catch specific errors from makePipeline helper
@@ -813,6 +828,73 @@ class MetalService {
         return true
     }
     
+    /// Encodes a Softmax operation on the rows of a matrix using MPSMatrixSoftMax.
+    ///
+    /// - Parameters:
+    ///   - commandBuffer: The command buffer to encode onto.
+    ///   - inputMatrixBuffer: Buffer containing the input matrix (e.g., attention scores).
+    ///   - outputMatrixBuffer: Buffer where the softmax result will be written.
+    ///   - rows: Number of rows in the matrix (e.g., number of heads or batch size).
+    ///   - columns: Number of columns in the matrix (e.g., sequence length). Softmax is applied across this dimension.
+    ///   - label: Optional label for the MPS kernel encoding.
+    /// - Returns: True if encoding was successful, false otherwise.
+    func encodeMPSSoftMax(
+        commandBuffer: MTLCommandBuffer,
+        inputMatrixBuffer: MTLBuffer,
+        outputMatrixBuffer: MTLBuffer,
+        rows: Int,
+        columns: Int,
+        label: String? = nil
+    ) -> Bool {
+
+        guard rows > 0, columns > 0 else {
+            print("Error [MPS SoftMax]: Rows and columns must be positive. Got rows=\(rows), columns=\(columns)")
+            return false
+        }
+
+        let bytesPerElement = MemoryLayout<Float16>.stride
+        let rowBytes = columns * bytesPerElement // Each row has 'columns' elements
+        guard rowBytes > 0 else { // Ensure columns > 0 resulted in positive rowBytes
+             print("Error [MPS SoftMax]: Calculated rowBytes is not positive.")
+             return false
+        }
+
+        // --- Buffer Size Checks ---
+        let expectedSize = rows * rowBytes
+        guard inputMatrixBuffer.length >= expectedSize else {
+            print("Error [MPS SoftMax]: Input buffer too small. Needs \(expectedSize) (rows=\(rows), cols=\(columns)), has \(inputMatrixBuffer.length).")
+            return false
+        }
+        guard outputMatrixBuffer.length >= expectedSize else {
+            print("Error [MPS SoftMax]: Output buffer too small. Needs \(expectedSize) (rows=\(rows), cols=\(columns)), has \(outputMatrixBuffer.length).")
+            return false
+        }
+
+        // --- Create Descriptors & Matrices ---
+        // MPSMatrixSoftMax operates row-wise, so descriptor matches input/output shape.
+        // Initializers are non-failable according to compiler.
+        let desc = MPSMatrixDescriptor(rows: rows, columns: columns, rowBytes: rowBytes, dataType: .float16)
+
+        // Initialize directly, relying on size checks above.
+        let inputMatrix = MPSMatrix(buffer: inputMatrixBuffer, descriptor: desc)
+        let outputMatrix = MPSMatrix(buffer: outputMatrixBuffer, descriptor: desc)
+
+
+        // --- Create and Encode Kernel ---
+        // MPSMatrixSoftMax initializer is non-failable according to previous findings
+        let softmaxKernel = MPSMatrixSoftMax(device: self.device)
+        softmaxKernel.label = label ?? "MPSMatrixSoftMax"
+
+        softmaxKernel.encode(
+            commandBuffer: commandBuffer,
+            inputMatrix: inputMatrix,
+            resultMatrix: outputMatrix
+        )
+
+        print("Successfully encoded \(softmaxKernel.label ?? "MPS SoftMax") for \(rows)x\(columns) matrix.")
+        return true
+    }
+    
     /// Encodes the SiLU activation function onto a command buffer.
     /// Operates element-wise: output = input * sigmoid(input)
     ///
@@ -971,6 +1053,99 @@ class MetalService {
         encoder.endEncoding()
 
         print("Successfully encoded ElementWise Add kernel for \(elementCount) elements.")
+        return true
+    }
+    
+    /// Encodes the kernel to repeat KV heads for Grouped Query Attention.
+    /// Takes K or V with n_kv_heads and expands it to n_heads.
+    ///
+    /// - Parameters:
+    ///   - sourceBuffer: Input K or V buffer (layout: [seq_len, n_kv_head, head_dim]).
+    ///   - destinationBuffer: Output K or V buffer (layout: [seq_len, n_head, head_dim]).
+    ///   - numKVHeads: Number of key/value heads in the source.
+    ///   - numQueryGroups: Ratio n_head / n_kv_head.
+    ///   - headDim: Dimension of each head.
+    ///   - seqLen: Current sequence length being processed (number of rows in the source/dest seq dim).
+    ///   - commandBuffer: The command buffer to encode onto.
+    /// - Returns: True if encoding was successful, false otherwise.
+    func applyRepeatKVHeads(
+        sourceBuffer: MTLBuffer,
+        destinationBuffer: MTLBuffer,
+        numKVHeads: Int,
+        numQueryGroups: Int,
+        headDim: Int,
+        seqLen: Int,
+        commandBuffer: MTLCommandBuffer
+    ) -> Bool {
+        guard numKVHeads > 0, numQueryGroups > 0, headDim > 0, seqLen > 0 else {
+            print("Error [RepeatKV]: Invalid dimensions provided.")
+            return false
+        }
+
+        let nHead = numKVHeads * numQueryGroups
+
+        // --- Validate Buffer Sizes ---
+        let bytesPerElement = MemoryLayout<Float16>.stride
+        let expectedSourceSize = seqLen * numKVHeads * headDim * bytesPerElement
+        let expectedDestSize = seqLen * nHead * headDim * bytesPerElement
+
+        guard sourceBuffer.length >= expectedSourceSize else {
+            print("Error [RepeatKV]: Source buffer too small. Needs \(expectedSourceSize), has \(sourceBuffer.length).")
+            return false
+        }
+        guard destinationBuffer.length >= expectedDestSize else {
+             print("Error [RepeatKV]: Destination buffer too small. Needs \(expectedDestSize), has \(destinationBuffer.length).")
+            return false
+        }
+
+        // --- Prepare Arguments ---
+        var args = RepeatKVHeadsArgs(
+            num_kv_heads: UInt32(numKVHeads),
+            num_query_groups: UInt32(numQueryGroups),
+            head_dim: UInt32(headDim),
+            seq_len: UInt32(seqLen)
+        )
+
+        guard let argsBuffer = device.makeBuffer(
+            bytes: &args,
+            length: MemoryLayout<RepeatKVHeadsArgs>.size, // Use size of Swift struct
+            options: .storageModeShared
+        ) else {
+            print("Error [RepeatKV]: Failed to create args buffer.")
+            return false
+        }
+        argsBuffer.label = "RepeatKVHeads_Args"
+
+        // --- Encode Kernel ---
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            print("Error [RepeatKV]: Failed to create compute command encoder.")
+            return false
+        }
+        encoder.label = "RepeatKVHeads Kernel Encoder"
+
+        encoder.setComputePipelineState(repeatKVHeadsPipelineState)
+        encoder.setBuffer(sourceBuffer, offset: 0, index: 0)      // src
+        encoder.setBuffer(destinationBuffer, offset: 0, index: 1) // dst
+        encoder.setBuffer(argsBuffer, offset: 0, index: 2)        // args
+
+        // --- Dispatch Threads ---
+        // Grid size matches the total number of elements in the *destination* buffer
+        let totalDestElements = expectedDestSize / bytesPerElement
+        guard totalDestElements > 0 else { // Should be covered by dimension checks, but good practice
+             print("Error [RepeatKV]: Calculated zero destination elements.")
+             encoder.endEncoding() // Need to end encoding before returning false
+             return false
+        }
+
+        let gridSize = MTLSize(width: totalDestElements, height: 1, depth: 1)
+        // Choose thread group size (can be reasonably large for simple copy)
+        let threadGroupWidth = min(repeatKVHeadsPipelineState.maxTotalThreadsPerThreadgroup, 1024)
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+
+        print("Successfully encoded RepeatKVHeads kernel for DestSize: \(seqLen)x\(nHead)x\(headDim).")
         return true
     }
 }

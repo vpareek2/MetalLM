@@ -62,6 +62,17 @@ struct ContentView: View {
                 Label("Run ElemWise Add Test", systemImage: "plus.square")
             }
             .padding(.bottom)
+            
+            Button {
+                 if let service = modelLoaderWrapper.getMetalService() {
+                    testRepeatKVHeads(metalService: service)
+                } else {
+                    modelLoaderWrapper.currentStatus = "Error: Metal Service not available for test."
+                }
+            } label: {
+                Label("Run GQA Repeat Test", systemImage: "rectangle.3.group") // Icon suggestion
+            }
+            .padding(.bottom)
 
             // --- ADD SiLU Test Button ---
             Button {
@@ -88,6 +99,17 @@ struct ContentView: View {
                 Label("Run MPS MatMul Test", systemImage: "function")
             }
             .padding(.vertical)
+            
+            Button {
+                if let service = modelLoaderWrapper.getMetalService() {
+                   testMPSSoftMax(metalService: service)
+               } else {
+                   modelLoaderWrapper.currentStatus = "Error: Metal Service not available for test."
+               }
+           } label: {
+               Label("Run MPS SoftMax Test", systemImage: "chart.bar") // Icon suggestion
+           }
+           .padding(.bottom)
 
             // --- Optional: Keep the original Load & RoPE Test button ---
             /*
@@ -476,6 +498,140 @@ struct ContentView: View {
         print("--- ElementWise Add Test Complete ---")
         self.modelLoaderWrapper.currentStatus = testResultMessage
     }
+    
+    @MainActor
+    private func testRepeatKVHeads(metalService: MetalService) {
+        self.modelLoaderWrapper.currentStatus = "Running GQA Repeat KV Heads Test..."
+        print("--- Running GQA Repeat KV Heads Test ---")
+
+        let device = metalService.device
+
+        // --- Define Test Parameters ---
+        let seqLen = 2
+        let numKVHeads = 2 // Number of K/V heads in source
+        let headDim = 4    // Dimension of each head
+        let numQueryGroups = 3 // Each KV head is shared by 3 Query heads
+        let nHead = numKVHeads * numQueryGroups // Total number of heads in destination (2 * 3 = 6)
+
+        print("  Params: SeqLen=\(seqLen), KVHeads=\(numKVHeads), HeadDim=\(headDim), Groups=\(numQueryGroups), TotalHeads=\(nHead)")
+
+        // --- Create Source Data ---
+        // Layout: [seqLen, numKVHeads, headDim]
+        // Example: s0_kv0_d0..3, s0_kv1_d0..3, s1_kv0_d0..3, s1_kv1_d0..3
+        var sourceData = [Float16]()
+        for s in 0..<seqLen {
+            for kvh in 0..<numKVHeads {
+                for d in 0..<headDim {
+                    // Create unique values like 1000*s + 100*kvh + d
+                    sourceData.append(Float16(1000 * s + 100 * kvh + d))
+                }
+            }
+        }
+        let sourceElementCount = sourceData.count
+        print("  Source Data (\(sourceElementCount) elements): \(sourceData.map { Float($0) })")
+
+        // --- Calculate Expected Output Data ---
+        // Layout: [seqLen, nHead, headDim]
+        var expectedOutput = [Float16]()
+        for s in 0..<seqLen {
+            for h in 0..<nHead { // Iterate through destination heads
+                let src_h = h / numQueryGroups // Find the source head index
+                for d in 0..<headDim {
+                    // Get the corresponding value from the source head
+                    let srcValue = Float16(1000 * s + 100 * src_h + d)
+                    expectedOutput.append(srcValue)
+                }
+            }
+        }
+        let destElementCount = expectedOutput.count
+        print("  Expected Dest Data (\(destElementCount) elements): \(expectedOutput.map { Float($0) })")
+
+
+        // --- Create Metal Buffers ---
+        let sourceBufferSize = sourceElementCount * MemoryLayout<Float16>.stride
+        let destBufferSize = destElementCount * MemoryLayout<Float16>.stride
+
+        guard sourceBufferSize > 0, destBufferSize > 0 else {
+             print("GQA Repeat Test Error: Calculated buffer size is zero.")
+             self.modelLoaderWrapper.currentStatus = "GQA Repeat Test Error: Zero buffer size."
+             return
+        }
+
+        guard let sourceBuffer = device.makeBuffer(bytes: sourceData, length: sourceBufferSize, options: .storageModeShared),
+              let destBuffer = device.makeBuffer(length: destBufferSize, options: .storageModeShared) else {
+            print("GQA Repeat Test Error: Failed to create buffers.")
+            self.modelLoaderWrapper.currentStatus = "GQA Repeat Test Error: Failed to create buffers."
+            return
+        }
+        sourceBuffer.label = "GQA Repeat Test Source"
+        destBuffer.label = "GQA Repeat Test Dest"
+
+        // --- Encode and Execute ---
+        guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
+            print("GQA Repeat Test Error: Failed to create command buffer.")
+            self.modelLoaderWrapper.currentStatus = "GQA Repeat Test Error: Failed to create command buffer."
+            return
+        }
+        commandBuffer.label = "GQA Repeat Test CB"
+
+        let success = metalService.applyRepeatKVHeads(
+            sourceBuffer: sourceBuffer,
+            destinationBuffer: destBuffer,
+            numKVHeads: numKVHeads,
+            numQueryGroups: numQueryGroups,
+            headDim: headDim,
+            seqLen: seqLen,
+            commandBuffer: commandBuffer
+        )
+
+        guard success else {
+            print("GQA Repeat Test Error: applyRepeatKVHeads returned false.")
+            self.modelLoaderWrapper.currentStatus = "GQA Repeat Test Error: Encoding failed."
+            return
+        }
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // --- Verify Results ---
+        var testResultMessage = ""
+        if let error = commandBuffer.error {
+            print("GQA Repeat Test Error: Command buffer execution failed: \(error)")
+            testResultMessage = "GQA Repeat Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+        } else {
+            var resultData = [Float16](repeating: 0, count: destElementCount)
+            let resultPtr = destBuffer.contents().bindMemory(to: Float16.self, capacity: destElementCount)
+            let sourceBufferPtr = UnsafeBufferPointer(start: resultPtr, count: destElementCount)
+            // Apply fix for warning
+            _ = resultData.withUnsafeMutableBufferPointer { $0.initialize(from: sourceBufferPtr) }
+
+            let tolerance: Float16 = 0.01 // Exact copy, tolerance should be near zero
+            var mismatch = false
+            for i in 0..<destElementCount {
+                if abs(resultData[i] - expectedOutput[i]) > tolerance {
+                    mismatch = true
+                    print("Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])")
+                }
+            }
+
+            let resultStrings = resultData.map { String(format: "%.0f", Float($0)) } // Use %.0f for integer-like values
+            let expectedStrings = expectedOutput.map { String(format: "%.0f", Float($0)) }
+
+            // Print smaller chunks if output is large
+            let printLimit = 64
+            print("GQA Repeat Test Result:   \(resultStrings.prefix(printLimit))...")
+            print("GQA Repeat Test Expected: \(expectedStrings.prefix(printLimit))...")
+
+            if mismatch {
+                testResultMessage = "GQA Repeat Test FAILED: Results do not match expected values."
+            } else {
+                testResultMessage = "GQA Repeat Test PASSED!"
+            }
+            print(testResultMessage)
+        }
+        print("--- GQA Repeat KV Heads Test Complete ---")
+        self.modelLoaderWrapper.currentStatus = testResultMessage
+    }
 
     // --- ADDED SiLU TEST FUNCTION ---
     @MainActor
@@ -723,6 +879,138 @@ struct ContentView: View {
 
         print("--- MPS MatMul Test Complete ---")
         // Update status on main thread
+        self.modelLoaderWrapper.currentStatus = testResultMessage
+    }
+    // Inside ContentView struct
+
+    // --- ADDED MPS SoftMax TEST FUNCTION ---
+    @MainActor
+    private func testMPSSoftMax(metalService: MetalService) {
+        self.modelLoaderWrapper.currentStatus = "Running MPS SoftMax Test..."
+        print("--- Running MPS SoftMax Test ---")
+
+        let device = metalService.device
+
+        // --- Define Test Data (e.g., 2 rows, 4 columns) ---
+        let rows = 2
+        let columns = 4
+        let inputData: [Float16] = [1.0, 2.0, 3.0, 4.0,  // Row 0 (logits)
+                                    -1.0, 0.0, 1.0, 0.5] // Row 1 (logits)
+        let elementCount = rows * columns
+
+        // Calculate expected output manually (using Float for intermediate precision)
+        var expectedOutput = [Float16](repeating: 0, count: elementCount)
+        for r in 0..<rows {
+            let rowOffset = r * columns
+            let inputRow = (0..<columns).map { Float(inputData[rowOffset + $0]) }
+
+            // Find max for numerical stability
+            let maxVal = inputRow.max() ?? 0.0
+            // Calculate exp and sum
+            let exps = inputRow.map { exp($0 - maxVal) }
+            let sumExps = exps.reduce(0, +)
+            // Calculate softmax
+            for c in 0..<columns {
+                expectedOutput[rowOffset + c] = Float16(exps[c] / sumExps)
+            }
+        }
+
+        // --- Create Metal Buffers ---
+        let bufferSize = elementCount * MemoryLayout<Float16>.stride
+        guard let inputBuffer = device.makeBuffer(bytes: inputData, length: bufferSize, options: .storageModeShared),
+              let outputBuffer = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
+            print("SoftMax Test Error: Failed to create buffers.")
+            self.modelLoaderWrapper.currentStatus = "SoftMax Test Error: Failed to create buffers."
+            return
+        }
+        inputBuffer.label = "SoftMax Test Input"
+        outputBuffer.label = "SoftMax Test Output"
+
+        // --- Encode and Execute ---
+        guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
+            print("SoftMax Test Error: Failed to create command buffer.")
+            self.modelLoaderWrapper.currentStatus = "SoftMax Test Error: Failed to create command buffer."
+            return
+        }
+        commandBuffer.label = "SoftMax Test CB"
+
+        let success = metalService.encodeMPSSoftMax(
+            commandBuffer: commandBuffer,
+            inputMatrixBuffer: inputBuffer,
+            outputMatrixBuffer: outputBuffer,
+            rows: rows,
+            columns: columns
+        )
+
+        guard success else {
+            print("SoftMax Test Error: encodeMPSSoftMax returned false.")
+            self.modelLoaderWrapper.currentStatus = "SoftMax Test Error: Encoding failed."
+            return
+        }
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // --- Verify Results ---
+        var testResultMessage = ""
+        if let error = commandBuffer.error {
+            print("SoftMax Test Error: Command buffer execution failed: \(error)")
+            testResultMessage = "SoftMax Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+        } else {
+            var resultData = [Float16](repeating: 0, count: elementCount)
+            let resultPtr = outputBuffer.contents().bindMemory(to: Float16.self, capacity: elementCount)
+            let sourceBufferPtr = UnsafeBufferPointer(start: resultPtr, count: elementCount)
+            // Apply fix for warning
+            _ = resultData.withUnsafeMutableBufferPointer { $0.initialize(from: sourceBufferPtr) }
+
+            let tolerance: Float16 = 0.01 // Softmax involves exp, might need slightly larger tolerance
+            var mismatch = false
+            var rowSums: [Float] = Array(repeating: 0.0, count: rows)
+
+            print("SoftMax Test Verification:")
+            for r in 0..<rows {
+                var currentRowSum: Float = 0.0
+                print("  Row \(r):")
+                for c in 0..<columns {
+                    let index = r * columns + c
+                    let resultVal = resultData[index]
+                    let expectedVal = expectedOutput[index]
+                    currentRowSum += Float(resultVal) // Sum results as Float
+
+                    if abs(resultVal - expectedVal) > tolerance {
+                        mismatch = true
+                        print("    Mismatch at [\(r),\(c)]: Got \(resultVal), Expected \(expectedVal)")
+                    }
+                    // Check if value is valid probability (0 to 1)
+                    if !(resultVal >= 0.0 && resultVal <= 1.0) {
+                         mismatch = true
+                         print("    Invalid probability at [\(r),\(c)]: Got \(resultVal)")
+                    }
+                }
+                rowSums[r] = currentRowSum
+                print("    Row Sum: \(currentRowSum)")
+                // Check if row sum is close to 1.0
+                if abs(currentRowSum - 1.0) > Float(tolerance * Float16(columns)) { // Allow larger tolerance for sum
+                     mismatch = true
+                     print("    Row Sum deviates significantly from 1.0!")
+                }
+            }
+
+
+            let resultStrings = resultData.map { String(format: "%.4f", Float($0)) }
+            let expectedStrings = expectedOutput.map { String(format: "%.4f", Float($0)) }
+
+            print("SoftMax Test Result:   \(resultStrings)")
+            print("SoftMax Test Expected: \(expectedStrings)")
+
+            if mismatch {
+                testResultMessage = "SoftMax Test FAILED: Verification failed (check console)."
+            } else {
+                testResultMessage = "SoftMax Test PASSED!"
+            }
+            print(testResultMessage)
+        }
+        print("--- MPS SoftMax Test Complete ---")
         self.modelLoaderWrapper.currentStatus = testResultMessage
     }
 }
