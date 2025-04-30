@@ -48,6 +48,8 @@ class MetalService {
     let rmsNormF16PipelineState: MTLComputePipelineState
     let ropeF16PipelineState: MTLComputePipelineState?  // Optional if kernel might fail loading
     let siluF16PipelineState: MTLComputePipelineState
+    let mulF16PipelineState: MTLComputePipelineState
+    let addF16PipelineState: MTLComputePipelineState
 
     static let shared = MetalService()
 
@@ -123,6 +125,12 @@ class MetalService {
             self.siluF16PipelineState = try makePipeline(functionName: "kernel_silu_f16")
             print("Pipeline state created for kernel_silu_f16")
             // --- END ADD ---
+            
+            self.mulF16PipelineState = try makePipeline(functionName: "kernel_mul_f16")
+            print("Pipeline state created for kernel_mul_f16")
+            
+            self.addF16PipelineState = try makePipeline(functionName: "kernel_add_f16")
+            print("Pipeline state created for kernel_add_f16")
 
         } catch let error as MetalServiceError {
             // Catch specific errors from makePipeline helper
@@ -867,6 +875,102 @@ class MetalService {
         encoder.endEncoding()
 
         print("Successfully encoded SiLU kernel for \(elementCount) elements.")
+        return true
+    }
+    
+    /// Encodes an element-wise multiplication operation (C = A * B) onto a command buffer.
+    func applyElementWiseMul(
+        inputBufferA: MTLBuffer,
+        inputBufferB: MTLBuffer,
+        outputBufferC: MTLBuffer,
+        elementCount: Int,
+        commandBuffer: MTLCommandBuffer
+    ) -> Bool {
+        guard elementCount > 0 else { return true }
+
+        let bufferSize = elementCount * MemoryLayout<Float16>.stride
+        guard inputBufferA.length >= bufferSize,
+              inputBufferB.length >= bufferSize,
+              outputBufferC.length >= bufferSize else {
+            print("Error [Mul]: Buffer size mismatch.")
+            // Add details if needed
+            return false
+        }
+
+        var nelementsArg = UInt64(elementCount)
+        guard let nelementsBuffer = device.makeBuffer(bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared) else {
+            print("Error [Mul]: Failed to create nelements buffer.")
+            return false
+        }
+        nelementsBuffer.label = "Mul_nelements"
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            print("Error [Mul]: Failed to create compute command encoder.")
+            return false
+        }
+        encoder.label = "ElementWise Mul Kernel Encoder"
+
+        encoder.setComputePipelineState(mulF16PipelineState)
+        encoder.setBuffer(inputBufferA, offset: 0, index: 0)   // a
+        encoder.setBuffer(inputBufferB, offset: 0, index: 1)   // b
+        encoder.setBuffer(outputBufferC, offset: 0, index: 2)  // c
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 3) // ne
+
+        let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
+        let threadGroupWidth = min(mulF16PipelineState.maxTotalThreadsPerThreadgroup, 1024)
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+
+        print("Successfully encoded ElementWise Mul kernel for \(elementCount) elements.")
+        return true
+    }
+    
+    func applyElementWiseAdd(
+        inputBufferA: MTLBuffer,
+        inputBufferB: MTLBuffer,
+        outputBufferC: MTLBuffer,
+        elementCount: Int,
+        commandBuffer: MTLCommandBuffer
+    ) -> Bool {
+        guard elementCount > 0 else { return true }
+
+        let bufferSize = elementCount * MemoryLayout<Float16>.stride
+        guard inputBufferA.length >= bufferSize,
+              inputBufferB.length >= bufferSize,
+              outputBufferC.length >= bufferSize else {
+            print("Error [Add]: Buffer size mismatch.")
+            return false
+        }
+
+        var nelementsArg = UInt64(elementCount)
+        guard let nelementsBuffer = device.makeBuffer(bytes: &nelementsArg, length: MemoryLayout<UInt64>.size, options: .storageModeShared) else {
+            print("Error [Add]: Failed to create nelements buffer.")
+            return false
+        }
+        nelementsBuffer.label = "Add_nelements"
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            print("Error [Add]: Failed to create compute command encoder.")
+            return false
+        }
+        encoder.label = "ElementWise Add Kernel Encoder"
+
+        encoder.setComputePipelineState(addF16PipelineState)
+        encoder.setBuffer(inputBufferA, offset: 0, index: 0)   // a
+        encoder.setBuffer(inputBufferB, offset: 0, index: 1)   // b
+        encoder.setBuffer(outputBufferC, offset: 0, index: 2)  // c
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 3) // ne
+
+        let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
+        let threadGroupWidth = min(addF16PipelineState.maxTotalThreadsPerThreadgroup, 1024)
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+
+        print("Successfully encoded ElementWise Add kernel for \(elementCount) elements.")
         return true
     }
 }

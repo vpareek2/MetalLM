@@ -39,6 +39,30 @@ struct ContentView: View {
             }
             Divider()
 
+            // --- ADD Mul Test Button ---
+            Button {
+                if let service = modelLoaderWrapper.getMetalService() {
+                    testElementWiseMul(metalService: service)
+                } else {
+                    modelLoaderWrapper.currentStatus =
+                        "Error: Metal Service not available for test."
+                }
+            } label: {
+                Label("Run ElemWise Mul Test", systemImage: "multiply.square")
+            }
+            .padding(.bottom)
+            
+            Button {
+                 if let service = modelLoaderWrapper.getMetalService() {
+                    testElementWiseAdd(metalService: service)
+                } else {
+                    modelLoaderWrapper.currentStatus = "Error: Metal Service not available for test."
+                }
+            } label: {
+                Label("Run ElemWise Add Test", systemImage: "plus.square")
+            }
+            .padding(.bottom)
+
             // --- ADD SiLU Test Button ---
             Button {
                 if let service = modelLoaderWrapper.getMetalService() {
@@ -265,6 +289,192 @@ struct ContentView: View {
         print("--- RoPE Sanity Check Complete ---")
         */
         print("--- RoPE Sanity Check SKIPPED (Commented out in ContentView) ---")
+    }
+
+    // --- ADDED ElementWise Mul TEST FUNCTION ---
+    @MainActor
+    private func testElementWiseMul(metalService: MetalService) {
+        self.modelLoaderWrapper.currentStatus = "Running ElementWise Mul Test..."
+        print("--- Running ElementWise Mul Test ---")
+
+        let device = metalService.device
+
+        // --- Define Test Data ---
+        let inputA: [Float16] = [1.0, 2.0, -3.0, 0.5, 10.0]
+        let inputB: [Float16] = [2.0, 0.5, 2.0, -4.0, 0.1]
+        let expectedOutput: [Float16] = [2.0, 1.0, -6.0, -2.0, 1.0]  // A * B
+        let elementCount = inputA.count
+
+        // --- Create Metal Buffers ---
+        let bufferSize = elementCount * MemoryLayout<Float16>.stride
+        guard
+            let bufferA = device.makeBuffer(
+                bytes: inputA, length: bufferSize, options: .storageModeShared),
+            let bufferB = device.makeBuffer(
+                bytes: inputB, length: bufferSize, options: .storageModeShared),
+            let bufferC = device.makeBuffer(length: bufferSize, options: .storageModeShared)
+        else {
+            print("Mul Test Error: Failed to create buffers.")
+            self.modelLoaderWrapper.currentStatus = "Mul Test Error: Failed to create buffers."
+            return
+        }
+        bufferA.label = "Mul Test Input A"
+        bufferB.label = "Mul Test Input B"
+        bufferC.label = "Mul Test Output C"
+
+        // --- Encode and Execute ---
+        guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
+            print("Mul Test Error: Failed to create command buffer.")
+            self.modelLoaderWrapper.currentStatus =
+                "Mul Test Error: Failed to create command buffer."
+            return
+        }
+        commandBuffer.label = "Mul Test CB"
+
+        let success = metalService.applyElementWiseMul(
+            inputBufferA: bufferA,
+            inputBufferB: bufferB,
+            outputBufferC: bufferC,
+            elementCount: elementCount,
+            commandBuffer: commandBuffer
+        )
+
+        guard success else {
+            print("Mul Test Error: applyElementWiseMul returned false.")
+            self.modelLoaderWrapper.currentStatus = "Mul Test Error: Encoding failed."
+            return
+        }
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // --- Verify Results ---
+        var testResultMessage = ""
+        if let error = commandBuffer.error {
+            print("Mul Test Error: Command buffer execution failed: \(error)")
+            testResultMessage =
+                "Mul Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+        } else {
+            var resultData = [Float16](repeating: 0, count: elementCount)
+            let resultPtr = bufferC.contents().bindMemory(to: Float16.self, capacity: elementCount)
+            let sourceBuffer = UnsafeBufferPointer(start: resultPtr, count: elementCount)
+            _ = resultData.withUnsafeMutableBufferPointer { $0.initialize(from: sourceBuffer) }
+
+            let tolerance: Float16 = 0.01
+            var mismatch = false
+            for i in 0..<elementCount {
+                if abs(resultData[i] - expectedOutput[i]) > tolerance {
+                    mismatch = true
+                    print(
+                        "Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])"
+                    )
+                }
+            }
+
+            let resultStrings = resultData.map { String(format: "%.2f", Float($0)) }
+            let expectedStrings = expectedOutput.map { String(format: "%.2f", Float($0)) }
+
+            print("Mul Test Result:   \(resultStrings)")
+            print("Mul Test Expected: \(expectedStrings)")
+
+            if mismatch {
+                testResultMessage = "Mul Test FAILED: Results do not match expected values."
+            } else {
+                testResultMessage = "Mul Test PASSED!"
+            }
+            print(testResultMessage)
+        }
+        print("--- ElementWise Mul Test Complete ---")
+        self.modelLoaderWrapper.currentStatus = testResultMessage
+    }
+    
+    @MainActor
+    private func testElementWiseAdd(metalService: MetalService) {
+        self.modelLoaderWrapper.currentStatus = "Running ElementWise Add Test..."
+        print("--- Running ElementWise Add Test ---")
+
+        let device = metalService.device
+
+        // --- Define Test Data ---
+        let inputA: [Float16] = [1.0,  2.0, -3.0, 0.5, 10.0, -5.0]
+        let inputB: [Float16] = [2.0, -0.5,  2.0, 4.0, -0.1,  5.0]
+        let expectedOutput: [Float16] = [3.0,  1.5, -1.0, 4.5,  9.9,  0.0] // A + B
+        let elementCount = inputA.count
+
+        // --- Create Metal Buffers ---
+        let bufferSize = elementCount * MemoryLayout<Float16>.stride
+        guard let bufferA = device.makeBuffer(bytes: inputA, length: bufferSize, options: .storageModeShared),
+              let bufferB = device.makeBuffer(bytes: inputB, length: bufferSize, options: .storageModeShared),
+              let bufferC = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
+            print("Add Test Error: Failed to create buffers.")
+            self.modelLoaderWrapper.currentStatus = "Add Test Error: Failed to create buffers."
+            return
+        }
+        bufferA.label = "Add Test Input A"
+        bufferB.label = "Add Test Input B"
+        bufferC.label = "Add Test Output C"
+
+        // --- Encode and Execute ---
+        guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
+            print("Add Test Error: Failed to create command buffer.")
+            self.modelLoaderWrapper.currentStatus = "Add Test Error: Failed to create command buffer."
+            return
+        }
+        commandBuffer.label = "Add Test CB"
+
+        let success = metalService.applyElementWiseAdd(
+            inputBufferA: bufferA,
+            inputBufferB: bufferB,
+            outputBufferC: bufferC,
+            elementCount: elementCount,
+            commandBuffer: commandBuffer
+        )
+
+        guard success else {
+            print("Add Test Error: applyElementWiseAdd returned false.")
+            self.modelLoaderWrapper.currentStatus = "Add Test Error: Encoding failed."
+            return
+        }
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // --- Verify Results ---
+        var testResultMessage = ""
+        if let error = commandBuffer.error {
+            print("Add Test Error: Command buffer execution failed: \(error)")
+            testResultMessage = "Add Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+        } else {
+            var resultData = [Float16](repeating: 0, count: elementCount)
+            let resultPtr = bufferC.contents().bindMemory(to: Float16.self, capacity: elementCount)
+            let sourceBuffer = UnsafeBufferPointer(start: resultPtr, count: elementCount)
+            // Apply fix for warning
+            _ = resultData.withUnsafeMutableBufferPointer { $0.initialize(from: sourceBuffer) }
+
+            let tolerance: Float16 = 0.01
+            var mismatch = false
+            for i in 0..<elementCount {
+                if abs(resultData[i] - expectedOutput[i]) > tolerance {
+                    mismatch = true
+                    print("Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])")
+                }
+            }
+
+            let resultStrings = resultData.map { String(format: "%.2f", Float($0)) }
+            let expectedStrings = expectedOutput.map { String(format: "%.2f", Float($0)) }
+
+            print("Add Test Result:   \(resultStrings)")
+            print("Add Test Expected: \(expectedStrings)")
+
+            if mismatch {
+                testResultMessage = "Add Test FAILED: Results do not match expected values."
+            } else {
+                testResultMessage = "Add Test PASSED!"
+            }
+            print(testResultMessage)
+        }
+        print("--- ElementWise Add Test Complete ---")
+        self.modelLoaderWrapper.currentStatus = testResultMessage
     }
 
     // --- ADDED SiLU TEST FUNCTION ---
