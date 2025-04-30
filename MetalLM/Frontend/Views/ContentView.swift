@@ -39,21 +39,30 @@ struct ContentView: View {
             }
             Divider()
 
-            // --- Load/Test Button ---
-            // Modified Button to run MatMul test
+            // --- ADD SiLU Test Button ---
             Button {
-                // No need for async Task for this simple CPU-bound + short GPU test setup
-                // Ensure MetalService is available before running the test
                 if let service = modelLoaderWrapper.getMetalService() {
-                    testMPSMatMul(metalService: service)  // Just run the MatMul test directly
+                    testSILU(metalService: service)  // Run the SiLU test
                 } else {
                     modelLoaderWrapper.currentStatus =
                         "Error: Metal Service not available for test."
                 }
             } label: {
-                Label("Run MPS MatMul Test", systemImage: "function")  // Updated label
+                Label("Run SiLU Kernel Test", systemImage: "function")
             }
-            // .disabled(selectedFileURL == nil || !modelLoaderWrapper.isMetadataLoaded || isLoading) // Enable if needed based on dependencies
+            .padding(.bottom)  // Add some spacing if needed
+
+            // --- Load/Test Button for MatMul (Keep or comment out) ---
+            Button {
+                if let service = modelLoaderWrapper.getMetalService() {
+                    testMPSMatMul(metalService: service)
+                } else {
+                    modelLoaderWrapper.currentStatus =
+                        "Error: Metal Service not available for test."
+                }
+            } label: {
+                Label("Run MPS MatMul Test", systemImage: "function")
+            }
             .padding(.vertical)
 
             // --- Optional: Keep the original Load & RoPE Test button ---
@@ -258,6 +267,115 @@ struct ContentView: View {
         print("--- RoPE Sanity Check SKIPPED (Commented out in ContentView) ---")
     }
 
+    // --- ADDED SiLU TEST FUNCTION ---
+    @MainActor
+    private func testSILU(metalService: MetalService) {
+        self.modelLoaderWrapper.currentStatus = "Running SiLU Kernel Test..."
+        print("--- Running SiLU Kernel Test ---")
+
+        let device = metalService.device
+
+        // --- Define Test Data ---
+        let inputData: [Float16] = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
+        let elementCount = inputData.count
+
+        // Calculate expected output using Float for precision
+        let expectedOutput: [Float16] = inputData.map { x_h in
+            let x = Float(x_h)
+            let sigmoid_x = 1.0 / (1.0 + exp(-x))
+            return Float16(x * sigmoid_x)
+        }
+
+        // --- Create Metal Buffers ---
+        let bufferSize = elementCount * MemoryLayout<Float16>.stride
+        guard
+            let inputBuffer = device.makeBuffer(
+                bytes: inputData, length: bufferSize, options: .storageModeShared),
+            let outputBuffer = device.makeBuffer(length: bufferSize, options: .storageModeShared)
+        else {
+            print("SiLU Test Error: Failed to create buffers.")
+            self.modelLoaderWrapper.currentStatus = "SiLU Test Error: Failed to create buffers."
+            return
+        }
+        inputBuffer.label = "SiLU Test Input"
+        outputBuffer.label = "SiLU Test Output"
+
+        // --- Encode and Execute ---
+        guard let commandBuffer = metalService.commandQueue.makeCommandBuffer() else {
+            print("SiLU Test Error: Failed to create command buffer.")
+            self.modelLoaderWrapper.currentStatus =
+                "SiLU Test Error: Failed to create command buffer."
+            return
+        }
+        commandBuffer.label = "SiLU Test CB"
+
+        // Call the dispatch function
+        let success = metalService.applySILU(
+            inputBuffer: inputBuffer,
+            outputBuffer: outputBuffer,
+            elementCount: elementCount,
+            commandBuffer: commandBuffer
+        )
+
+        guard success else {
+            print("SiLU Test Error: applySILU returned false.")
+            self.modelLoaderWrapper.currentStatus =
+                "SiLU Test Error: Encoding failed (check console logs)."
+            return
+        }
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // --- Verify Results ---
+        var testResultMessage = ""
+        if let error = commandBuffer.error {
+            print("SiLU Test Error: Command buffer execution failed: \(error)")
+            testResultMessage =
+                "SiLU Test FAILED: Command buffer execution failed: \(error.localizedDescription)"
+        } else {
+            // Copy result back to CPU
+            var resultData = [Float16](repeating: 0, count: elementCount)
+            let resultPtr = outputBuffer.contents().bindMemory(
+                to: Float16.self, capacity: elementCount)
+            let sourceBuffer = UnsafeBufferPointer(start: resultPtr, count: elementCount)
+            resultData.withUnsafeMutableBufferPointer { destinationPointer in
+                _ = destinationPointer.initialize(from: sourceBuffer)
+            }
+
+            // Compare
+            let tolerance: Float16 = 0.01  // Adjust tolerance as needed for f16
+            var mismatch = false
+            for i in 0..<elementCount {
+                if abs(resultData[i] - expectedOutput[i]) > tolerance {
+                    mismatch = true
+                    print(
+                        "Mismatch at index \(i): Got \(resultData[i]), Expected \(expectedOutput[i])"
+                    )
+                    // break // Uncomment to stop at first mismatch
+                }
+            }
+
+            // Use String(format:) for cleaner float printing
+            let resultStrings = resultData.map { String(format: "%.4f", Float($0)) }
+            let expectedStrings = expectedOutput.map { String(format: "%.4f", Float($0)) }
+
+            print("SiLU Test Result:   \(resultStrings)")
+            print("SiLU Test Expected: \(expectedStrings)")
+
+            if mismatch {
+                testResultMessage =
+                    "SiLU Test FAILED: Results do not match expected values (check console)."
+                print(testResultMessage)
+            } else {
+                testResultMessage = "SiLU Test PASSED!"
+                print(testResultMessage)
+            }
+        }
+        print("--- SiLU Kernel Test Complete ---")
+        self.modelLoaderWrapper.currentStatus = testResultMessage
+    }
+
     // --- ADDED MPS MatMul TEST FUNCTION ---
     // Example Test Function (Place appropriately, e.g., in ContentView for quick testing)
     @MainActor  // Ensure UI updates happen on main thread if needed
@@ -327,12 +445,12 @@ struct ContentView: View {
         let success = metalService.encodeMPSMatrixMultiply(
             commandBuffer: commandBuffer,
             inputA: bufferA,
-            inputB: bufferB, // Still contains B_data_rowMajor (3x4)
+            inputB: bufferB,  // Still contains B_data_rowMajor (3x4)
             outputC: bufferC,
             M: M, N: N, K: K,
             transposeA: false,
-            transposeB: false, // <--- CHANGE THIS TO FALSE
-            label: "TestMatMul_2x3_3x4_tB_false" // Update label for clarity
+            transposeB: false,  // <--- CHANGE THIS TO FALSE
+            label: "TestMatMul_2x3_3x4_tB_false"  // Update label for clarity
         )
 
         guard success else {

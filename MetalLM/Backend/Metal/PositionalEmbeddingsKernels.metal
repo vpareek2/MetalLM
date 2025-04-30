@@ -10,8 +10,10 @@ using namespace metal;
 //------------------------------------------------------------------------------
 
 // Corrected: Apply alignment attribute to the struct type declaration
-struct [[metal::aligned(4)]] MetalRopeArgs { // <-- CORRECT placement for struct alignment
+//struct [[metal::aligned(4)]] MetalRopeArgs {
                                            // using metal::aligned is often more explicit in MSL
+struct MetalRopeArgs { // <-- CORRECT placement for struct alignment
+
 
     // Dimensions (Natural alignment is 4 bytes)
     uint n_dims;

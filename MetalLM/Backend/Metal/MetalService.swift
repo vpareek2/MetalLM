@@ -47,6 +47,7 @@ class MetalService {
     let convertF16toF32PipelineState: MTLComputePipelineState
     let rmsNormF16PipelineState: MTLComputePipelineState
     let ropeF16PipelineState: MTLComputePipelineState?  // Optional if kernel might fail loading
+    let siluF16PipelineState: MTLComputePipelineState
 
     static let shared = MetalService()
 
@@ -117,6 +118,11 @@ class MetalService {
                 print("Error: kernel_rope_f16_inplace function not found.")
                 self.ropeF16PipelineState = nil  // Or handle error more strictly
             }
+
+            // --- ADD SiLU Pipeline Loading ---
+            self.siluF16PipelineState = try makePipeline(functionName: "kernel_silu_f16")
+            print("Pipeline state created for kernel_silu_f16")
+            // --- END ADD ---
 
         } catch let error as MetalServiceError {
             // Catch specific errors from makePipeline helper
@@ -796,6 +802,71 @@ class MetalService {
         print(
             "Successfully encoded \(matMulKernel.label ?? "MPS MatMul") M=\(M), N=\(N), K=\(K), tA=\(transposeA), tB=\(transposeB)"
         )
+        return true
+    }
+    
+    /// Encodes the SiLU activation function onto a command buffer.
+    /// Operates element-wise: output = input * sigmoid(input)
+    ///
+    /// - Parameters:
+    ///   - inputBuffer: The buffer containing input data (Float16).
+    ///   - outputBuffer: The buffer to write the output data (Float16).
+    ///   - elementCount: The number of elements in the buffers.
+    ///   - commandBuffer: The command buffer to encode the operation onto.
+    /// - Returns: True if encoding was successful, false otherwise.
+    func applySILU(
+        inputBuffer: MTLBuffer,
+        outputBuffer: MTLBuffer,
+        elementCount: Int,
+        commandBuffer: MTLCommandBuffer // Takes command buffer as input
+    ) -> Bool {
+        guard elementCount > 0 else {
+            print("Warning [SiLU]: Attempting to apply SiLU with zero elements.")
+            // Technically okay, just encode nothing.
+            return true
+        }
+
+        // Basic Size Check (Optional but good practice)
+        let bufferSize = elementCount * MemoryLayout<Float16>.stride
+        guard inputBuffer.length >= bufferSize, outputBuffer.length >= bufferSize else {
+            print("Error [SiLU]: Buffer size mismatch. Need \(bufferSize), Input=\(inputBuffer.length), Output=\(outputBuffer.length)")
+            return false
+        }
+
+        // Create buffer for element count argument
+        var nelementsArg = UInt64(elementCount)
+        guard let nelementsBuffer = device.makeBuffer(
+            bytes: &nelementsArg,
+            length: MemoryLayout<UInt64>.size,
+            options: .storageModeShared // Or .storageModePrivate if only GPU access needed after creation
+        ) else {
+            print("Error [SiLU]: Failed to create nelements buffer.")
+            return false
+        }
+        nelementsBuffer.label = "SiLU_nelements"
+
+
+        // Encode kernel
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            print("Error [SiLU]: Failed to create compute command encoder.")
+            return false
+        }
+        encoder.label = "SiLU Kernel Encoder"
+
+        encoder.setComputePipelineState(siluF16PipelineState)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)    // src
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)   // dst
+        encoder.setBuffer(nelementsBuffer, offset: 0, index: 2) // elementCount
+
+        // Calculate grid and threadgroup sizes
+        let gridSize = MTLSize(width: elementCount, height: 1, depth: 1)
+        let threadGroupWidth = min(siluF16PipelineState.maxTotalThreadsPerThreadgroup, 1024) // Simple kernel can use larger groups
+        let threadGroupSize = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
+        encoder.endEncoding()
+
+        print("Successfully encoded SiLU kernel for \(elementCount) elements.")
         return true
     }
 }
