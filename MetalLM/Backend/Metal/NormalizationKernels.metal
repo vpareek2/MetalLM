@@ -1,11 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
-
 struct MetalRMSNormArgs {
     float    eps;
     uint64_t ne00;
 };
-
 // RMSNorm kernel for Float16 data
 // Applies normalization and scales by a weight vector (gamma)
 kernel void kernel_rms_norm_f16(
@@ -59,18 +57,24 @@ kernel void kernel_rms_norm_f16(
 
     // Calculate RMS and scale factor (using F32)
     float mean_sq = sum_sq_f32 / float(args.ne00);
-    float rms = sqrt(mean_sq + args.eps);
-    float scale = 1.0f / rms;
-    // half scale_f16 = half(scale); // Optional: if direct f16 math is preferred below
+    // Add safety floor and ceiling
+    float safe_mean_sq = max(mean_sq, 1e-10f);
+    float rms = sqrt(safe_mean_sq + args.eps);
+    float scale = min(1.0f / rms, 1e6f); // Cap scale factor to avoid extreme values
+
+    // Add debug output for troubleshooting
+    if (tpitg == 0 && tgpig == 0) {
+//        print("RMSNorm: sum_sq=%f, mean_sq=%f, safe_value=%f, rms=%f, scale=%f, eps=%f\n",
+//               sum_sq_f32, mean_sq, safe_mean_sq, rms, scale, args.eps);
+    }
 
     // Apply normalization and weight scaling
     for (uint i = tpitg; i < args.ne00; i += ntg) {
         half w = weight[i];
-        // Calculate in F32 for potentially better precision before converting back
+        // Safety check on weights
+        if (isnan(float(w)) || isinf(float(w))) {
+            w = 1.0h; // Use safe default if weight is corrupt
+        }
         y[i] = half( (float(x[i]) * scale) * float(w) );
-        // Or directly in half:
-        // y[i] = (x[i] * scale_f16) * w;
     }
 }
-
-// Add other LayerNorm/Normalization kernels here later if needed

@@ -841,9 +841,8 @@ class MetalService {
         // --- Calculate Row Bytes based on ACTUAL columns in buffers ---
         let rowBytesA_Int = colsA * bytesPerElement
         let rowBytesB_Int = colsB * bytesPerElement
-        let rowBytesC_Int = N * bytesPerElement  // Output C always has N columns
 
-        guard rowBytesA_Int > 0, rowBytesB_Int > 0, rowBytesC_Int > 0 else {
+        guard rowBytesA_Int > 0, rowBytesB_Int > 0 else {
             print("Error [MPS MatMul]: Calculated rowBytes must be positive.")
             return false
         }
@@ -851,19 +850,46 @@ class MetalService {
         // --- Buffer Size Checks based on ACTUAL layout ---
         let expectedSizeA = rowsA * rowBytesA_Int
         let expectedSizeB = rowsB * rowBytesB_Int
-        let expectedSizeC = M * rowBytesC_Int  // Output C always has M rows
 
         guard inputA.length >= expectedSizeA else { /* ... error ... */ return false }
         guard inputB.length >= expectedSizeB else { /* ... error ... */ return false }
-        guard outputC.length >= expectedSizeC else { /* ... error ... */ return false }
 
         // --- Create Descriptors based on ACTUAL layout ---
         let descA = MPSMatrixDescriptor(
             rows: rowsA, columns: colsA, rowBytes: rowBytesA_Int, dataType: .float16)
         let descB = MPSMatrixDescriptor(
             rows: rowsB, columns: colsB, rowBytes: rowBytesB_Int, dataType: .float16)
+
+        // --- FIX: Determine Output Type based on outputC buffer ---
+        // Determine expected element size based on buffer length and dimensions
+        let outputElementSize = (M > 0 && N > 0) ? (outputC.length / (M * N)) : 0
+        let outputDataType: MPSDataType
+        if outputElementSize == MemoryLayout<Float>.stride {
+            outputDataType = .float32
+            print("  DescC: Using MPSDataType.float32 (Inferred Size: \(outputElementSize))")
+        } else if outputElementSize == MemoryLayout<Float16>.stride {
+            outputDataType = .float16
+             print("  DescC: Using MPSDataType.float16 (Inferred Size: \(outputElementSize))")
+        } else {
+            // Fallback or error - default to F16? Or throw? Let's default and warn.
+            print("  DescC WARNING: Could not infer element size (\(outputElementSize)) for output buffer \(outputC.label ?? "C"). Defaulting to float16.")
+            outputDataType = .float16
+        }
+        // --- END FIX ---
+
+        // Ensure rowBytesC_Int is correct for the INTENDED output type
+        let rowBytesC_Int = N * outputElementSize // Use inferred/actual element size
+
+        guard rowBytesC_Int > 0 else {
+            print("Error [MPS MatMul]: Calculated rowBytes must be positive.")
+            return false
+        }
+
+        let expectedSizeC = M * rowBytesC_Int  // Output C always has M rows
+        guard outputC.length >= expectedSizeC else { /* ... error ... */ return false }
+
         let descC = MPSMatrixDescriptor(
-            rows: M, columns: N, rowBytes: rowBytesC_Int, dataType: .float16)  // Output descriptor matches result dimensions
+            rows: M, columns: N, rowBytes: rowBytesC_Int, dataType: outputDataType) // Use determined type
 
         // --- Create MPSMatrix Objects ---
         let matrixA = MPSMatrix(buffer: inputA, descriptor: descA)
