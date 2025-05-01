@@ -27,11 +27,11 @@ struct block_q4_K {
 };
 
 struct block_q6_K {
-    half d;                         // scale factor (fp16)
-    uint8_t scales[QK_K / 16];      // scales for groups of 16 (linear scaling factor)
-    uint8_t ql[QK_K / 2];           // lower 4 bits of quants (packed, 4 bits each)
-    uint8_t qh[QK_K / 4];           // upper 2 bits of quants (packed, 2 bits each)
-}; // Size: 2 + 16 + 128 + 64 = 210 bytes
+    uint8_t ql[QK_K/2];      // quants, lower 4 bits
+    uint8_t qh[QK_K/4];      // quants, upper 2 bits
+    int8_t  scales[QK_K/16]; // scales, quantized with 8 bits (MUST BE SIGNED int8_t)
+    half    d;               // super-block scale
+}; // Size: 128 + 64 + 16 + 2 = 210 bytes
 
 //----------------------------------------------------------------------
 // Helper Functions for Q4_K (M/S)
@@ -91,6 +91,7 @@ kernel void kernel_dequantize_q4_K_f32(
     dst[gid] = dequantized_value;
 }
 
+
 // Dequantization kernel for Q4_K blocks into Float16 (half)
 kernel void kernel_dequantize_q4_K_f16(
     device const block_q4_K * src [[buffer(0)]], // Input buffer with quantized blocks
@@ -127,56 +128,48 @@ kernel void kernel_dequantize_q4_K_f16(
 // Dequantization Kernels for Q6_K
 //----------------------------------------------------------------------
 
-// Dequantization kernel for Q6_K blocks into Float32
 kernel void kernel_dequantize_q6_K_f32(
-    device const block_q6_K * src [[buffer(0)]], // Input buffer with quantized blocks
-    device       float        * dst [[buffer(1)]], // Output buffer for dequantized floats
-    constant   uint64_t     & nelements [[buffer(2)]], // Total number of elements to dequantize
-    uint                  gid [[thread_position_in_grid]]) // Global thread ID
+    device const block_q6_K * src [[buffer(0)]],
+    device       float      * dst [[buffer(1)]],
+    constant   uint64_t     & nelements [[buffer(2)]],
+    uint                      gid [[thread_position_in_grid]])
 {
     if (gid >= nelements) return;
 
-    // Calculate block and index within block
     uint64_t superblock_idx = gid / QK_K;
-    uint     idx_in_superblock = gid % QK_K; // Index 0-255 within the block
-
-    // Get pointer to current block
+    uint     idx_in_superblock = gid % QK_K;
     device const block_q6_K * b = src + superblock_idx;
 
-    // Get global scale for the block
+    // Calculate offsets within the block
+    uint block_idx = idx_in_superblock / 128;
+    uint l_idx = (idx_in_superblock % 128) % 32;
+    uint offset_in_block = (idx_in_superblock % 128) / 32;
+    
+    // Get pointers to the data for this block
+    device const uint8_t * ql = b->ql + block_idx * 64;
+    device const uint8_t * qh = b->qh + block_idx * 32;
+    device const int8_t  * sc = b->scales + block_idx * 8;
+    
     float d = float(b->d);
-
-    // --- Extract Scale ---
-    // Q6_K has 16 scales, each covering 16 elements
-    uint scale_idx = idx_in_superblock / 16; // Scale index 0-15
-    // Scales are stored directly as int8 in ggml.c, let's assume the same here for simplicity
-    // If they were packed 4-bit, unpacking needed:
-    // uint8_t packed_scales_byte = b->scales[scale_idx / 2];
-    // uint8_t scale_nibble = (scale_idx % 2 == 0) ? (packed_scales_byte & 0xF) : (packed_scales_byte >> 4);
-    // float scale = float(scale_nibble) - 8.0f; // Correction based on ggml.c
-    // --- Assuming direct int8 scales for now (verify if needed) ---
-    float scale = float(b->scales[scale_idx]); // Direct access if scales are 1 byte each
-
-    // --- Extract Quantized Value (Lower 4 bits + Upper 2 bits) ---
-    // Lower 4 bits (from ql)
-    uint ql_idx = idx_in_superblock / 2; // Byte index in ql
-    uint8_t ql_byte = b->ql[ql_idx];
-    uint8_t q_low = (idx_in_superblock % 2 == 0) ? (ql_byte & 0xF) : (ql_byte >> 4);
-
-    // Upper 2 bits (from qh)
-    uint qh_idx = idx_in_superblock / 4; // Byte index in qh
-    uint8_t qh_byte = b->qh[qh_idx];
-    uint8_t shift_h = (idx_in_superblock % 4) * 2; // Shift amount: 0, 2, 4, or 6
-    uint8_t q_high = (qh_byte >> shift_h) & 3; // Isolate the 2 bits
-
-    // Combine into 6-bit integer value (0-63)
-    int q6 = (int(q_high) << 4) | int(q_low);
-
-    // Dequantize (Formula from ggml.c: d * scale * (q - 32))
-    // Subtract 32 because the 6-bit value represents a range centered around 0.
-    float dequantized_value = d * scale * (float(q6) - 32.0f);
-
-    dst[gid] = dequantized_value;
+    
+    int is = l_idx / 16;
+    int scaled_idx = offset_in_block * 32 + l_idx;
+    
+    // Extract the quant value following llama.cpp logic
+    int8_t q;
+    if (scaled_idx < 32) {
+        q = (int8_t)((ql[l_idx] & 0xF) | (((qh[l_idx] >> 0) & 3) << 4)) - 32;
+        dst[gid] = d * float(sc[is + 0]) * float(q);
+    } else if (scaled_idx < 64) {
+        q = (int8_t)((ql[l_idx + 32] & 0xF) | (((qh[l_idx] >> 2) & 3) << 4)) - 32;
+        dst[gid] = d * float(sc[is + 2]) * float(q);
+    } else if (scaled_idx < 96) {
+        q = (int8_t)((ql[l_idx] >> 4) | (((qh[l_idx] >> 4) & 3) << 4)) - 32;
+        dst[gid] = d * float(sc[is + 4]) * float(q);
+    } else {
+        q = (int8_t)((ql[l_idx + 32] >> 4) | (((qh[l_idx] >> 6) & 3) << 4)) - 32;
+        dst[gid] = d * float(sc[is + 6]) * float(q);
+    }
 }
 
 // Dequantization kernel for Q6_K blocks into Float16 (half)

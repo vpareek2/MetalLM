@@ -114,25 +114,38 @@ class ModelLoaderWrapper: ObservableObject {
 
             // --- Instantiate the Runner ---
             guard let service = self.metalService else {
-                // Should not happen if wrapper init succeeded, but check anyway
                 currentStatus = "Error: MetalService unavailable for Runner creation."
                 print("Error: MetalService unavailable when creating LlamaRunner.")
-                self.llamaModel = nil  // Clear model if runner fails
+                self.llamaModel = nil
                 return
             }
             do {
+                // --- CHOOSE ONE RUNNER TO UNCOMMENT ---
+                // Option 1: Use the original runner
                 self.llamaRunner = try LlamaRunner(model: loadedModel, metalService: service)
                 currentStatus =
                     "Success: Full model '\(url.lastPathComponent)' loaded and Runner initialized!"
                 print("Wrapper: Full model assembly and Runner initialization complete.")
-            } catch let error as LlamaRunnerError {
+
+                // Option 2: Use the debug runner (if still debugging forward pass)
+                // self.llamaRunner = try DebugLlamaRunner(model: loadedModel, metalService: service)
+                // currentStatus =
+                //    "Success: Full model '\(url.lastPathComponent)' loaded and DEBUG Runner initialized!"
+                // print("Wrapper: Full model assembly and DEBUG Runner initialization complete.")
+                // --------------------------------------
+
+            } catch let error as LlamaRunnerError { // Now reachable
                 currentStatus = "Model loaded, but Runner init failed (KV Cache?): \(error)"
                 print("LlamaRunner initialization failed: \(error)")
-                self.llamaModel = nil  // Clear model if runner fails
-            } catch {
+                self.llamaModel = nil
+            } catch let error as DebugRunnerError { // Now reachable (only if using DebugLlamaRunner)
+                currentStatus = "Model loaded, but DEBUG Runner init failed: \(error)"
+                print("DebugLlamaRunner initialization failed: \(error)")
+                self.llamaModel = nil
+            } catch { // Now reachable
                 currentStatus = "Model loaded, but Runner init failed unexpectedly: \(error)"
                 print("LlamaRunner initialization failed with unexpected error: \(error)")
-                self.llamaModel = nil  // Clear model if runner fails
+                self.llamaModel = nil
             }
             // --- End Runner Instantiation ---
 
@@ -161,6 +174,7 @@ class ModelLoaderWrapper: ObservableObject {
 }
 
 // Helper functions to access private properties safely
+// Helper functions to access private properties safely
 @MainActor
 extension ModelLoaderWrapper {
     func getMetalService() -> MetalService? {
@@ -174,6 +188,7 @@ extension ModelLoaderWrapper {
         return self.llamaModel
     }
 
+    // V-- CHANGE THE RETURN TYPE HERE --V
     func getLlamaRunner() -> LlamaRunner? {
         return self.llamaRunner
     }

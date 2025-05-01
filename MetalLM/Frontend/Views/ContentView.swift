@@ -142,6 +142,17 @@ struct ContentView: View {
             // Disable button if runner isn't ready
             .disabled(modelLoaderWrapper.getLlamaRunner() == nil || isLoading)
 
+            // Inside ContentView body
+
+            // --- Update Forward Pass Test Button ---
+            Button {
+                guard modelLoaderWrapper.getLlamaRunner() != nil else { /* ... */ return }
+                testForwardPassAndSample()  // Call the UPDATED test function
+            } label: {
+                Label("Run Forward Pass + Sample", systemImage: "forward.fill")  // Updated label
+            }
+            .padding(.bottom)
+            .disabled(modelLoaderWrapper.getLlamaRunner() == nil || isLoading)
             Button {
                 Task {
                     await loadFullModelAndTestRope()
@@ -203,6 +214,81 @@ struct ContentView: View {
         }
         .padding()
         .frame(minWidth: 500, minHeight: 350)
+    }
+    // Add this function inside ContentView or somewhere accessible
+
+    // Inside ContentView.swift
+
+    @MainActor
+    func validateEmbeddingRowCPU(
+        embeddingBuffer: MTLBuffer,
+        tokenID: Int,
+        embeddingDim: Int,
+        label: String
+    ) -> Bool {
+        print("--- Validating Embedding Row on CPU: \(label) (Token ID: \(tokenID))...")
+        // --- CORRECTION: Use Float size and type ---
+        let elementSize = MemoryLayout<Float>.stride // Use Float size
+        let rowSize = embeddingDim * elementSize
+        let sourceOffset = tokenID * rowSize
+
+        // --- Basic Checks ---
+        guard embeddingDim > 0 else { /*...*/ return false }
+        guard embeddingBuffer.length >= sourceOffset + rowSize else { /*...*/ return false }
+        guard embeddingBuffer.storageMode != .private else { /*...*/ return false }
+
+        // --- Read Data ---
+        // --- CORRECTION: Bind to Float ---
+        let pointer = embeddingBuffer.contents().advanced(by: sourceOffset).bindMemory(to: Float.self, capacity: embeddingDim)
+        let bufferPointer = UnsafeBufferPointer(start: pointer, count: embeddingDim)
+
+        // --- Check for NaN/Inf ---
+        var isValid = true
+        var firstNanIndex = -1
+        var firstInfIndex = -1
+        for i in 0..<embeddingDim {
+            let value = bufferPointer[i] // Reads Float now
+            if value.isNaN { // Checks Float.isNaN
+                if firstNanIndex == -1 { firstNanIndex = i }
+                isValid = false
+            }
+            if value.isInfinite { // Checks Float.isInfinite
+                if firstInfIndex == -1 { firstInfIndex = i }
+                isValid = false
+            }
+            if !isValid { break }
+        }
+
+        if !isValid {
+            print("!!! CPU Validation FAILED for embedding row '\(label)' (Token ID: \(tokenID)): Found NaN @\(firstNanIndex) / Inf @\(firstInfIndex).")
+        } else {
+            print("--- CPU Validation PASSED for embedding row '\(label)' (Token ID: \(tokenID)).")
+        }
+        return isValid
+    }
+
+
+    private func argmax(logits: [Float16]) -> Int? {
+        guard !logits.isEmpty else {
+            print("Warning: Argmax called with empty logits array.")
+            return nil
+        }
+
+        // Convert to Float for safer comparison
+        let floatLogits = logits.map { Float($0) }
+
+        var maxVal: Float = -Float.infinity
+        var maxIndex: Int = -1
+
+        // Manual iteration to find max index
+        for (index, value) in floatLogits.enumerated() {
+            if value > maxVal {
+                maxVal = value
+                maxIndex = index
+            }
+        }
+
+        return maxIndex != -1 ? maxIndex : nil
     }
 
     // File selection function remains the same
@@ -1299,6 +1385,141 @@ struct ContentView: View {
 
         print(testResultMessage)
         print("--- Forward Pass (No Attention) Test Complete ---")
+        self.modelLoaderWrapper.currentStatus = testResultMessage
+    }
+    // Inside ContentView struct
+
+    // --- UPDATED Forward Pass + Sample TEST FUNCTION ---
+    @MainActor
+    private func testForwardPassAndSample() {
+        self.modelLoaderWrapper.currentStatus = "Running Forward Pass + Sample Test..."
+        print("--- Running Forward Pass + Sample Test ---")
+
+        // 1. Get Runner Instance AND Metal Service AND MODEL
+        guard let runner = modelLoaderWrapper.getLlamaRunner(),
+//            let metalService = modelLoaderWrapper.getMetalService(),
+            let loadedModel = modelLoaderWrapper.getLoadedModel()  // <-- Get the loaded model
+        else {
+            let msg =
+                "Forward Pass Test Error: Runner, Service, or Model not initialized. Load model first."
+            print(msg)
+            self.modelLoaderWrapper.currentStatus = msg
+            return
+        }
+
+        // 2. Reset State
+        runner.resetState()
+        guard runner.currentPosition == 0 else { /* ... error handling ... */ return }
+
+        // 3. Define Starting Token
+        let bosTokenID = 1  // Or 128000 for Llama 3
+        print("  Using BOS Token ID: \(bosTokenID)")
+
+        // --- ADD: VALIDATE SOURCE EMBEDDING ROW ---
+        let embeddingDim = loadedModel.config.embeddingDim
+        let isEmbeddingRowValid = validateEmbeddingRowCPU(
+            embeddingBuffer: loadedModel.tokenEmbeddings,  // Pass the buffer from the model
+            tokenID: bosTokenID,
+            embeddingDim: embeddingDim,
+            label: "token_embd.weight"
+        )
+        guard isEmbeddingRowValid else {
+            let msg =
+                "Forward Pass Test Error: Source embedding data for token \(bosTokenID) contains NaN/Inf."
+            print(msg)
+            self.modelLoaderWrapper.currentStatus = msg
+            return  // Stop the test here if source data is bad
+        }
+        print("  Source embedding row for token \(bosTokenID) validated successfully.")
+        // --- END: VALIDATE SOURCE EMBEDDING ROW ---
+
+        // 4. Execute Forward Pass
+        print("  Calling runner.forward(tokenID: \(bosTokenID))...")
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        // --- Call the forward pass ---
+        let logitsBuffer = runner.forward(tokenID: bosTokenID)  // Includes attention now
+
+        let endTime = CFAbsoluteTimeGetCurrent()
+        let duration = String(format: "%.3f", endTime - startTime)
+        print("  runner.forward call completed in \(duration) seconds.")
+
+        // 5. Verify Execution and Sample
+        var testResultMessage = ""
+        if let returnedLogits = logitsBuffer {
+            print("  Forward pass returned a logits buffer.")
+            let vocabSize = runner.config.vocabSize  // Use runner.config here
+            let logitsCount = vocabSize
+            let logitsSizeBytes = logitsCount * MemoryLayout<Float16>.stride  // Still assuming F16 logits
+
+            if returnedLogits.length >= logitsSizeBytes {
+                print(
+                    "  Logits buffer has expected size (or larger): \(returnedLogits.length) bytes (Expected >= \(logitsSizeBytes))."
+                )
+
+                // --- ADD: Copy Logits to CPU ---
+                var cpuLogits = [Float16](repeating: 0, count: logitsCount)
+                // Assuming .storageModeShared for temp logitsBuffer
+                let logitsPtr = returnedLogits.contents().bindMemory(
+                    to: Float16.self, capacity: logitsCount)
+                let sourceBufferPtr = UnsafeBufferPointer(start: logitsPtr, count: logitsCount)
+                _ = cpuLogits.withUnsafeMutableBufferPointer {
+                    $0.initialize(from: sourceBufferPtr)
+                }
+                print("  Successfully copied logits to CPU (\(logitsCount) elements).")
+                // --- End Copy ---
+                // --- ADD DEBUG LOGS ---
+                let printLimit = 20
+                print(
+                    "  Logits (First \(printLimit)): \(cpuLogits.prefix(printLimit).map{Float($0)})"
+                )
+                print(
+                    "  Logits (Last \(printLimit)): \(cpuLogits.suffix(printLimit).map{Float($0)})")
+                // Check for NaN/Infinity
+                let nanCount = cpuLogits.filter { $0.isNaN }.count
+                let infCount = cpuLogits.filter { $0.isInfinite }.count
+                if nanCount > 0 || infCount > 0 {
+                    print("  WARNING: Logits contain \(nanCount) NaNs and \(infCount) Infinities!")
+                }
+                // --- END DEBUG LOGS ---
+
+                // --- ADD: Argmax Sampling ---
+                if let nextTokenID = argmax(logits: cpuLogits) {
+                    print("  Sampled Next Token ID (Argmax): \(nextTokenID)")
+                    // --- End Argmax ---
+
+                    // Basic check if ID is valid
+                    if nextTokenID >= 0 && nextTokenID < vocabSize {
+                        if runner.currentPosition == 1 {
+                            testResultMessage =
+                                "Forward Pass + Sample Test: PASSED (Executed, pos=\(runner.currentPosition), sampled ID: \(nextTokenID))."
+                            print(
+                                "  Runner position correctly updated to \(runner.currentPosition).")
+                        } else {
+                            testResultMessage =
+                                "Forward Pass + Sample Test: FAILED (Position not updated correctly, is \(runner.currentPosition))."
+                        }
+                    } else {
+                        testResultMessage =
+                            "Forward Pass + Sample Test: FAILED (Argmax returned invalid ID: \(nextTokenID))."
+                    }
+                } else {
+                    print("  Error: Failed to sample token using argmax.")
+                    testResultMessage =
+                        "Forward Pass + Sample Test: FAILED (Argmax sampling failed)."
+                }
+
+            } else {
+                testResultMessage =
+                    "Forward Pass + Sample Test: FAILED (Logits buffer size mismatch. Expected >= \(logitsSizeBytes), Got \(returnedLogits.length))."
+            }
+        } else {
+            testResultMessage =
+                "Forward Pass + Sample Test: FAILED (Returned nil logits buffer - check console for errors)."
+        }
+
+        print(testResultMessage)
+        print("--- Forward Pass + Sample Test Complete ---")
         self.modelLoaderWrapper.currentStatus = testResultMessage
     }
 }

@@ -310,6 +310,99 @@ class ModelLoader {
             throw ModelLoaderError.dequantizationFailed(tensorName, nil)
         }
 
+//        // --- ADD CPU VALIDATION OF THE *RESULT* (Checking First/Last 10k) ---
+//        if finalBuffer.storageMode != .private && elementCount > 0 {
+//            print(">>> DEBUG: Validating First/Last 10k of RESULT buffer '\(tensorName)' (type: \(outputType)) on CPU AFTER dequant...")
+//            var nanFound = false
+//            var infFound = false
+//            var firstProblemIndex = -1
+//            let elemSize = (outputType == .f16) ? 2 : 4
+//            let ptr = finalBuffer.contents()
+//
+//            // Calculate the actual number of elements we can safely check
+//            let actualElementCount = finalBuffer.length / elemSize
+//            let checkableElementCount = min(elementCount, actualElementCount) // Use the smaller of descriptor count or buffer capacity
+//
+//            let checkLimit = 10000 // <--- Set back to 10000
+//
+//            var issueFound = false
+//
+//            // Function to check a single element
+//            func checkElement(at index: Int) {
+//                guard !issueFound else { return }
+//                if index >= checkableElementCount { return }
+//
+//                let val: Float
+//                if outputType == .f16 {
+//                    val = Float(ptr.load(fromByteOffset: index * elemSize, as: Float16.self))
+//                } else { // F32
+//                    val = ptr.load(fromByteOffset: index * elemSize, as: Float.self)
+//                }
+//
+//                // Check for NaN, Inf, OR our specific negative markers
+//                if val.isNaN {
+//                    firstProblemIndex = index
+//                    nanFound = true
+//                    issueFound = true
+//                    print(">>> DEBUG: Problematic value found at index \(index): NaN")
+//                } else if val.isInfinite {
+//                     firstProblemIndex = index
+//                     infFound = true
+//                     issueFound = true
+//                     print(">>> DEBUG: Problematic value found at index \(index): Inf")
+//                } else if val == -1.0 { // Check for specific markers
+//                     firstProblemIndex = index; issueFound = true; print(">>> DEBUG: Problematic marker found at index \(index): -1.0 (d invalid)")
+//                } else if val == -2.0 {
+//                     firstProblemIndex = index; issueFound = true; print(">>> DEBUG: Problematic marker found at index \(index): -2.0 (scale invalid)")
+//                } else if val == -3.0 {
+//                     firstProblemIndex = index; issueFound = true; print(">>> DEBUG: Problematic marker found at index \(index): -3.0 (d*scale Inf)")
+//                } else if val == -4.0 {
+//                     firstProblemIndex = index; issueFound = true; print(">>> DEBUG: Problematic marker found at index \(index): -4.0 (d*scale NaN)")
+//                } else if val == -5.0 {
+//                     firstProblemIndex = index; issueFound = true; print(">>> DEBUG: Problematic marker found at index \(index): -5.0 (final Inf)")
+//                } else if val == -6.0 {
+//                     firstProblemIndex = index; issueFound = true; print(">>> DEBUG: Problematic marker found at index \(index): -6.0 (final NaN marker)")
+//                } else if val == -7.0 {
+//                     firstProblemIndex = index; issueFound = true; print(">>> DEBUG: Problematic marker found at index \(index): -7.0 (Inf * 0)")
+//                }
+//            }
+//
+//            // Check beginning
+//            print(">>> DEBUG: Checking first \(min(checkLimit, checkableElementCount)) elements...")
+//            for i in 0..<min(checkLimit, checkableElementCount) {
+//                checkElement(at: i)
+//                if issueFound { break }
+//            }
+//
+//            // Check end (only if no issue found yet and tensor is large enough)
+//            if !issueFound && checkableElementCount > checkLimit { // Check if there are elements beyond the first checkLimit
+//                 let startOffset = max(checkLimit, checkableElementCount - checkLimit) // Ensure startOffset doesn't overlap if tensor is small and >= checkLimit
+//                 let endOffset = checkableElementCount
+//                 if startOffset < endOffset { // Only check end if there's a valid range
+//                     print(">>> DEBUG: Checking last \(endOffset - startOffset) elements (from index \(startOffset))...")
+//                     for i in startOffset..<endOffset {
+//                        checkElement(at: i)
+//                        if issueFound { break }
+//                     }
+//                 } else {
+//                      print(">>> DEBUG: Skipping end check as tensor is too small or overlaps completely.")
+//                 }
+//            } else if !issueFound {
+//                 print(">>> DEBUG: Skipping end check (issue already found or tensor too small).")
+//            }
+//
+//            if !issueFound {
+//                print(">>> DEBUG: Subset validation (first/last \(checkLimit)) of RESULT buffer '\(tensorName)' appears valid after dequant.")
+//            } else {
+//                 // If NaNs/Infs found here, the dequant kernel IS the problem.
+//                 print("!!! DEBUG: NaN/Inf found in RESULT buffer '\(tensorName)' after dequant! (NaN: \(nanFound), Inf: \(infFound), FirstIndexChecked: \(firstProblemIndex))")
+//                 // Throw error to halt model loading
+//                 let errorType: DebugRunnerError = nanFound ? .nanDetected(bufferName: "\(tensorName)_result", firstIndex: firstProblemIndex) : .infDetected(bufferName: "\(tensorName)_result", firstIndex: firstProblemIndex)
+//                 throw ModelLoaderError.dequantizationFailed(tensorName, errorType)
+//             }
+//        }
+//        // --- END CPU VALIDATION ---
+
         let expectedSize: Int
         switch outputType {
         case .f16: expectedSize = elementCount * MemoryLayout<Float16>.size
@@ -361,6 +454,30 @@ class ModelLoader {
         }
         print("-------------------------------------------------")
 
+        // --- DEFINE tensorName HELPER *BEFORE* FIRST USE ---
+        let tensorName: @Sendable (String, Int?) throws -> String = { pattern, index in
+            if pattern.contains("%d") {
+                guard let index = index else {
+                    throw ModelLoaderError.tensorNameCreationFailed(layer: -1, type: pattern)
+                }
+                return String(format: pattern, index)
+            } else {
+                return pattern
+            }
+        }
+        // --- END tensorName DEFINITION ---
+
+        // --- NOW you can use tensorName for the debug log ---
+        let tokenEmbeddingsTensorName = try tensorName("token_embd.weight", nil)
+        if let originalEmbedType = tensorTypeLookup[tokenEmbeddingsTensorName] {
+            print(
+                ">>> DEBUG: Original GGUF type for '\(tokenEmbeddingsTensorName)' is \(originalEmbedType)"
+            )
+        } else {
+            print(">>> DEBUG: Tensor '\(tokenEmbeddingsTensorName)' not found in lookup!")
+            // This would be an error itself
+        }
+
         // --- MODIFIED getBuffer Helper ---
         // Now checks original type before deciding final target type
         let getBuffer: @Sendable (String, GGUFDataType) async throws -> MTLBuffer = {
@@ -390,17 +507,6 @@ class ModelLoader {
             }.value
         }
         // --- END MODIFIED getBuffer Helper ---
-
-        let tensorName: @Sendable (String, Int?) throws -> String = { pattern, index in
-            if pattern.contains("%d") {
-                guard let index = index else {
-                    throw ModelLoaderError.tensorNameCreationFailed(layer: -1, type: pattern)
-                }
-                return String(format: pattern, index)
-            } else {
-                return pattern
-            }
-        }
 
         print("Loading non-block tensors...")
         // Pass the desired precision (embeddingType, normWeightType) as the second arg to getBuffer
