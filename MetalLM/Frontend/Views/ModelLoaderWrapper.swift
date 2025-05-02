@@ -1,21 +1,19 @@
-
-
 import Foundation
 import Metal
 import SwiftUI
 
 @MainActor
 class ModelLoaderWrapper: ObservableObject {
-
     private var metalService: MetalService?
     private var modelLoader: ModelLoader?
+    private var tokenizer: Tokenizer?
 
     @Published var currentStatus: String = "Not loaded"
     @Published var isMetadataLoaded: Bool = false
     @Published var loadedModelConfig: LlamaConfig? = nil
 
     private var llamaModel: LlamaModel?
-    private var llamaRunner: LlamaRunner? // Using standard runner now
+    private var llamaRunner: LlamaRunner?
 
     init() {
         self.metalService = MetalService.shared
@@ -41,20 +39,19 @@ class ModelLoaderWrapper: ObservableObject {
         isMetadataLoaded = false
         loadedModelConfig = nil
         llamaModel = nil
-        llamaRunner = nil // Clear runner when loading new metadata
+        llamaRunner = nil
+        tokenizer = nil
 
         do {
             try await Task { try loader.loadMetadata(url: url) }.value
-            currentStatus =
-                "Metadata loaded for \(url.lastPathComponent). Ready to load full model."
+            currentStatus = "Metadata loaded for \(url.lastPathComponent). Ready to load full model."
             isMetadataLoaded = true
             if let metadata = loader.ggufFile?.metadata {
                 do {
                     self.loadedModelConfig = try LlamaConfig(metadata: metadata)
                     currentStatus += "\nConfig parsed."
                 } catch {
-                    currentStatus =
-                        "Metadata loaded, but failed to parse config: \(error.localizedDescription)"
+                    currentStatus = "Metadata loaded, but failed to parse config: \(error.localizedDescription)"
                     isMetadataLoaded = false
                 }
             }
@@ -68,7 +65,24 @@ class ModelLoaderWrapper: ObservableObject {
         print("Wrapper: Metadata loading complete. Status: \(currentStatus)")
     }
 
-    // --- FULL assembleFullModel FUNCTION ---
+    func loadTokenizer() async {
+        guard let loader = self.modelLoader, let ggufFile = loader.ggufFile else {
+            currentStatus = "Error: ModelLoader or GGUF file not initialized. Load metadata first."
+            return
+        }
+        print("Wrapper: Attempting to load tokenizer...")
+        currentStatus = "Loading tokenizer..."
+
+        do {
+            self.tokenizer = try Tokenizer(ggufFile: ggufFile)
+            currentStatus = "Tokenizer loaded successfully."
+        } catch {
+            currentStatus = "Error loading tokenizer: \(error.localizedDescription)"
+            self.tokenizer = nil
+        }
+        print("Wrapper: Tokenizer loading complete. Status: \(currentStatus)")
+    }
+
     func assembleFullModel(url: URL) async {
         guard let loader = self.modelLoader else {
             currentStatus = "Error: ModelLoader not initialized."
@@ -84,8 +98,7 @@ class ModelLoaderWrapper: ObservableObject {
             return
         }
         guard url == loader.ggufFile?.url else {
-            currentStatus =
-                "Error: Attempting to load full model from a different URL (\(url.lastPathComponent)) than the loaded metadata (\(loader.ggufFile?.url.lastPathComponent ?? "None")). Please re-select the file."
+            currentStatus = "Error: Attempting to load full model from a different URL (\(url.lastPathComponent)) than the loaded metadata (\(loader.ggufFile?.url.lastPathComponent ?? "None")). Please re-select the file."
             isMetadataLoaded = false
             return
         }
@@ -94,8 +107,10 @@ class ModelLoaderWrapper: ObservableObject {
         currentStatus = "Loading full model tensors..."
         llamaModel = nil
         llamaRunner = nil
+        tokenizer = nil
 
         let getBuffer: @Sendable (String, GGUFDataType) async throws -> MTLBuffer = { name, targetTypeIfNonF64 in
+            print("Requesting tensor: \(name) (Preferred type if not F64: \(targetTypeIfNonF64))")
             return try await Task { [weak self] in
                 guard let self = self, let loader = await self.modelLoader else {
                     throw ModelLoaderError.modelNotLoaded
@@ -105,7 +120,7 @@ class ModelLoaderWrapper: ObservableObject {
                     throw ModelLoaderError.tensorNotFound(name + " (lookup failed)")
                 }
                 let originalType = tensorDesc.type
-                print("Requesting tensor: \(name) (Original: \(originalType), Preferred Target: \(targetTypeIfNonF64))")
+                print("  Original type is: \(originalType)")
 
                 let finalTargetType: GGUFDataType
                 if originalType == .f64 {
@@ -130,10 +145,9 @@ class ModelLoaderWrapper: ObservableObject {
             }
         }
 
-        // Define desired types
-        let computePrecision: GGUFDataType = .f16 // Changed to f16 for consistency
+        let computePrecision: GGUFDataType = .f16
         let normWeightType: GGUFDataType = .f32
-        let embeddingType: GGUFDataType = .f16 // Changed to f16 to match LlamaRunner
+        let embeddingType: GGUFDataType = .f16
 
         do {
             async let tokenEmbeddingsBuffer = getBuffer(try tensorName("token_embd.weight", nil), embeddingType)
@@ -191,7 +205,6 @@ class ModelLoaderWrapper: ObservableObject {
             let awaitedFinalNorm = try await finalNormWeightBuffer
             let awaitedOutputWeight = try await outputWeightBuffer
 
-            // Validation Step
             print(">>> DEBUG WRAPPER: Re-validating awaitedOutputWeight before LlamaModel creation...")
             let outputWeightElementCount = awaitedOutputWeight.length / MemoryLayout<Float>.stride
             var isValidBeforeModel = true
@@ -222,7 +235,6 @@ class ModelLoaderWrapper: ObservableObject {
             }
             print(">>> DEBUG WRAPPER: awaitedOutputWeight validation PASSED before LlamaModel creation.")
 
-            // Assemble the final LlamaModel
             print("Assembling final LlamaModel...")
             let finalLlamaModel = LlamaModel(
                 config: config,
@@ -236,7 +248,12 @@ class ModelLoaderWrapper: ObservableObject {
             self.loadedModelConfig = finalLlamaModel.config
             print("LlamaModel assembly complete.")
 
-            // Instantiate the Runner
+            guard let ggufFile = loader.ggufFile else {
+                throw ModelLoaderError.modelNotLoaded
+            }
+            self.tokenizer = try Tokenizer(ggufFile: ggufFile)
+            print("Tokenizer initialized during model assembly.")
+
             guard let service = self.metalService else {
                 currentStatus = "Error: MetalService unavailable for Runner creation."
                 self.llamaModel = nil
@@ -249,8 +266,8 @@ class ModelLoaderWrapper: ObservableObject {
                 }
                 self.llamaRunner = try LlamaRunner(model: modelToRun, metalService: service)
                 currentStatus =
-                    "Success: Full model '\(url.lastPathComponent)' loaded and Runner initialized!"
-                print("Wrapper: Full model assembly and Runner initialization complete.")
+                    "Success: Full model '\(url.lastPathComponent)' loaded, tokenizer initialized, and Runner ready!"
+                print("Wrapper: Full model assembly, tokenizer, and Runner initialization complete.")
             } catch let error as LlamaRunnerError {
                 currentStatus = "Model loaded, but Runner init failed (KV Cache?): \(error)"
                 print("LlamaRunner initialization failed: \(error)")
@@ -267,6 +284,7 @@ class ModelLoaderWrapper: ObservableObject {
             self.llamaRunner = nil
             self.loadedModelConfig = nil
             self.isMetadataLoaded = false
+            self.tokenizer = nil
         } catch let error as ConfigError {
             currentStatus = "Error reading config during assembly: \(error)"
             print("Caught ConfigError during assembly: \(error)")
@@ -274,6 +292,7 @@ class ModelLoaderWrapper: ObservableObject {
             self.llamaRunner = nil
             self.loadedModelConfig = nil
             self.isMetadataLoaded = false
+            self.tokenizer = nil
         } catch {
             currentStatus = "Unexpected error assembling model: \(error.localizedDescription)"
             print("Caught unexpected error during assembly: \(error)")
@@ -281,25 +300,21 @@ class ModelLoaderWrapper: ObservableObject {
             self.llamaRunner = nil
             self.loadedModelConfig = nil
             self.isMetadataLoaded = false
+            self.tokenizer = nil
         }
     }
-
 
     func clearLoadedModel() {
         llamaRunner = nil
         llamaModel = nil
+        tokenizer = nil
         loadedModelConfig = nil
         isMetadataLoaded = false
         currentStatus = "Model unloaded. Select a GGUF file."
         modelLoader?.unloadModel()
-        print("Wrapper: Cleared loaded model.")
+        print("Wrapper: Cleared loaded model and tokenizer.")
     }
-} // End Class
 
-
-// Helper functions to access private properties safely
-@MainActor
-extension ModelLoaderWrapper {
     func getMetalService() -> MetalService? {
         return self.metalService
     }
@@ -308,8 +323,11 @@ extension ModelLoaderWrapper {
         return self.llamaModel
     }
 
-    // Ensure this returns the correct runner type being used
-    func getLlamaRunner() -> LlamaRunner? { // Changed back to LlamaRunner?
+    func getLlamaRunner() -> LlamaRunner? {
         return self.llamaRunner
+    }
+
+    func getTokenizer() -> Tokenizer? {
+        return self.tokenizer
     }
 }
