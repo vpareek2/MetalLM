@@ -19,7 +19,29 @@ enum ModelLoaderError: Error {
     case tensorNameCreationFailed(layer: Int, type: String)
 }
 
-// ... (Keep Error enum) ...
+enum ValidationLevel {
+    case none
+    case partial(sampleSize: Int)
+    case full
+}
+
+struct ValidationConfig {
+    static let loadingValidationLevel: ValidationLevel = {
+        #if DEBUG
+            return .partial(sampleSize: 1000)
+        #else
+            return .partial(sampleSize: 100)  // Minimal check even in release
+        #endif
+    }()
+
+    static let forwardPassValidationEnabled: Bool = {
+        #if DEBUG
+            return true
+        #else
+            return false
+        #endif
+    }()
+}
 
 class ModelLoader {
 
@@ -197,9 +219,8 @@ class ModelLoader {
     }
 
     /// Dequantizes or converts a tensor to the desired output type using Metal kernels. (Thread-Safe Cache Access)
-    /// Dequantizes or converts a tensor to the desired output type using Metal kernels. (Thread-Safe Cache Access)
-    /// Dequantizes or converts a tensor to the desired output type using Metal kernels. (Thread-Safe Cache Access)
-    internal func dequantizeTensor(tensorName: String, outputType: GGUFDataType) throws -> MTLBuffer {
+    internal func dequantizeTensor(tensorName: String, outputType: GGUFDataType) throws -> MTLBuffer
+    {
         guard let tensor = getTensorDescriptor(name: tensorName) else {
             throw ModelLoaderError.tensorNotFound(tensorName)
         }
@@ -233,8 +254,13 @@ class ModelLoader {
             return sourceBuffer
         }
         guard elementCount > 0 else {
-            print("Warning: Tensor '\(tensorName)' has zero elements. Creating empty buffer for type \(outputType).")
-            guard let emptyBuffer = metalService.device.makeBuffer(length: 1, options: .storageModeShared) else {
+            print(
+                "Warning: Tensor '\(tensorName)' has zero elements. Creating empty buffer for type \(outputType)."
+            )
+            guard
+                let emptyBuffer = metalService.device.makeBuffer(
+                    length: 1, options: .storageModeShared)
+            else {
                 throw ModelLoaderError.failedToCreateMetalBuffer("empty buffer for \(tensorName)")
             }
             emptyBuffer.label = "\(tensorName)_processed_\(outputType)_empty"
@@ -248,15 +274,20 @@ class ModelLoader {
 
         switch (originalType, outputType) {
         case (.q4_K, .f32):
-            processedBuffer = metalService.dequantizeQ4KM_to_f32(quantizedBuffer: sourceBuffer, elementCount: elementCount)
+            processedBuffer = metalService.dequantizeQ4KM_to_f32(
+                quantizedBuffer: sourceBuffer, elementCount: elementCount)
         case (.q4_K, .f16):
-            processedBuffer = metalService.dequantizeQ4KM_to_f16(quantizedBuffer: sourceBuffer, elementCount: elementCount)
+            processedBuffer = metalService.dequantizeQ4KM_to_f16(
+                quantizedBuffer: sourceBuffer, elementCount: elementCount)
         case (.q6_K, .f32):
-            processedBuffer = metalService.dequantizeQ6K_to_f32(quantizedBuffer: sourceBuffer, elementCount: elementCount)
+            processedBuffer = metalService.dequantizeQ6K_to_f32(
+                quantizedBuffer: sourceBuffer, elementCount: elementCount)
         case (.q6_K, .f16):
-            processedBuffer = metalService.dequantizeQ6K_to_f16(quantizedBuffer: sourceBuffer, elementCount: elementCount)
+            processedBuffer = metalService.dequantizeQ6K_to_f16(
+                quantizedBuffer: sourceBuffer, elementCount: elementCount)
         case (.f16, .f32):
-            processedBuffer = metalService.convertF16toF32(inputBuffer: sourceBuffer, elementCount: elementCount)
+            processedBuffer = metalService.convertF16toF32(
+                inputBuffer: sourceBuffer, elementCount: elementCount)
         case (.f32, .f16):
             throw ModelLoaderError.unsupportedTensorType(tensorName, outputType)
         case (.f64, .f32):
@@ -275,108 +306,113 @@ class ModelLoader {
         // Validate Buffer for NaNs/Infs
         if finalBuffer.storageMode == .shared || finalBuffer.storageMode == .managed {
             print("--- Validating \(tensorName) after processing to \(outputType) ---")
-            let elementSize = outputType == .f16 ? MemoryLayout<Float16>.stride : MemoryLayout<Float>.stride
+            let elementSize =
+                outputType == .f16 ? MemoryLayout<Float16>.stride : MemoryLayout<Float>.stride
             let actualElementCount = finalBuffer.length / elementSize
             let checkableElementCount = min(elementCount, actualElementCount)
-            var nanCount = 0
-            var infCount = 0
-            var firstNanIndex = -1
-            var firstInfIndex = -1
-            let pointer = finalBuffer.contents()
 
-            if outputType == .f16 {
-                let bufferPointer = pointer.assumingMemoryBound(to: Float16.self)
-                for i in 0..<checkableElementCount {
-                    let value = bufferPointer[i]
-                    if value.isNaN {
-                        if firstNanIndex == -1 { firstNanIndex = i }
-                        nanCount += 1
-                    }
-                    if value.isInfinite {
-                        if firstInfIndex == -1 { firstInfIndex = i }
-                        infCount += 1
-                    }
-                }
-            } else {
-                let bufferPointer = pointer.assumingMemoryBound(to: Float.self)
-                for i in 0..<checkableElementCount {
-                    let value = bufferPointer[i]
-                    if value.isNaN {
-                        if firstNanIndex == -1 { firstNanIndex = i }
-                        nanCount += 1
-                    }
-                    if value.isInfinite {
-                        if firstInfIndex == -1 { firstInfIndex = i }
-                        infCount += 1
-                    }
-                }
-            }
+            switch ValidationConfig.loadingValidationLevel {
+            case .none:
+                print("--- Validation SKIPPED (level: none) ---")
 
-            // Specific check for tokenID 1 if tensor is token_embd.weight
-            if tensorName == "token_embd.weight" && checkableElementCount >= 4096 {
-                let embeddingDim = 4096
-                let rowStart = 1 * embeddingDim
-                if rowStart + embeddingDim <= checkableElementCount {
-                    var rowNanCount = 0
-                    var rowInfCount = 0
-                    var rowFirstNanIndex = -1
-                    var rowFirstInfIndex = -1
-                    if outputType == .f16 {
-                        let bufferPointer = pointer.assumingMemoryBound(to: Float16.self)
-                        for i in rowStart..<(rowStart + embeddingDim) {
-                            let value = bufferPointer[i]
-                            if value.isNaN {
-                                if rowFirstNanIndex == -1 { rowFirstNanIndex = i - rowStart }
-                                rowNanCount += 1
-                            }
-                            if value.isInfinite {
-                                if rowFirstInfIndex == -1 { rowFirstInfIndex = i - rowStart }
-                                rowInfCount += 1
-                            }
+            case .partial(let sampleSize):
+                let checkCountStart = min(checkableElementCount, sampleSize)
+                let checkCountEnd =
+                    (checkableElementCount > sampleSize * 2)
+                    ? min(checkableElementCount - sampleSize, sampleSize) : 0
+                var issueFound = false
+                let pointer = finalBuffer.contents()
+
+                if outputType == .f16 {
+                    let bufferPointer = pointer.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<checkCountStart {
+                        if bufferPointer[i].isNaN || bufferPointer[i].isInfinite {
+                            issueFound = true
+                            break
                         }
-                    } else {
-                        let bufferPointer = pointer.assumingMemoryBound(to: Float.self)
-                        for i in rowStart..<(rowStart + embeddingDim) {
-                            let value = bufferPointer[i]
-                            if value.isNaN {
-                                if rowFirstNanIndex == -1 { rowFirstNanIndex = i - rowStart }
-                                rowNanCount += 1
-                            }
-                            if value.isInfinite {
-                                if rowFirstInfIndex == -1 { rowFirstInfIndex = i - rowStart }
-                                rowInfCount += 1
+                    }
+                    if !issueFound && checkCountEnd > 0 {
+                        let startEndCheck = actualElementCount - checkCountEnd
+                        for i in startEndCheck..<actualElementCount {
+                            if bufferPointer[i].isNaN || bufferPointer[i].isInfinite {
+                                issueFound = true
+                                break
                             }
                         }
                     }
-                    print("DEBUG: Validation for tokenID 1 in \(tensorName): \(rowNanCount) NaNs (first @ \(rowFirstNanIndex)), \(rowInfCount) Infs (first @ \(rowFirstInfIndex))")
-                    if rowNanCount > 0 || rowInfCount > 0 {
-                        throw ModelLoaderError.dequantizationFailed(tensorName, nil)
-                    }
-                    // Check index 38 specifically
-                    let index38 = rowStart + 38
-                    if outputType == .f16 {
-                        let valueAt38 = pointer.assumingMemoryBound(to: Float16.self)[index38]
-                        print("DEBUG: Value at index 38 for tokenID 1 in \(tensorName): \(valueAt38)")
-                        if valueAt38.isNaN {
-                            print("!!! NaN at index 38 for tokenID 1 in \(tensorName) !!!")
-                            throw ModelLoaderError.dequantizationFailed(tensorName, nil)
+                } else {
+                    let bufferPointer = pointer.assumingMemoryBound(to: Float.self)
+                    for i in 0..<checkCountStart {
+                        if bufferPointer[i].isNaN || bufferPointer[i].isInfinite {
+                            issueFound = true
+                            break
                         }
-                    } else {
-                        let valueAt38 = pointer.assumingMemoryBound(to: Float.self)[index38]
-                        print("DEBUG: Value at index 38 for tokenID 1 in \(tensorName): \(valueAt38)")
-                        if valueAt38.isNaN {
-                            print("!!! NaN at index 38 for tokenID 1 in \(tensorName) !!!")
-                            throw ModelLoaderError.dequantizationFailed(tensorName, nil)
+                    }
+                    if !issueFound && checkCountEnd > 0 {
+                        let startEndCheck = actualElementCount - checkCountEnd
+                        for i in startEndCheck..<actualElementCount {
+                            if bufferPointer[i].isNaN || bufferPointer[i].isInfinite {
+                                issueFound = true
+                                break
+                            }
                         }
                     }
                 }
-            }
 
-            if nanCount > 0 || infCount > 0 {
-                print("!!! Validation FAILED for \(tensorName): \(nanCount) NaNs (first @ \(firstNanIndex)), \(infCount) Infs (first @ \(firstInfIndex)) !!!")
-                throw ModelLoaderError.dequantizationFailed(tensorName, nil)
-            } else {
-                print("--- Validation PASSED for \(tensorName) ---")
+                if issueFound {
+                    print("!!! Validation FAILED (partial): Found NaN or Inf in \(tensorName) ---")
+                    throw ModelLoaderError.dequantizationFailed(tensorName, nil)
+                } else {
+                    print(
+                        "--- Validation PASSED (partial: checked \(checkCountStart + checkCountEnd) elements) ---"
+                    )
+                }
+
+            case .full:
+                var nanCount = 0
+                var infCount = 0
+                var firstNanIndex = -1
+                var firstInfIndex = -1
+                let pointer = finalBuffer.contents()
+
+                if outputType == .f16 {
+                    let bufferPointer = pointer.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<checkableElementCount {
+                        let value = bufferPointer[i]
+                        if value.isNaN {
+                            if firstNanIndex == -1 { firstNanIndex = i }
+                            nanCount += 1
+                        }
+                        if value.isInfinite {
+                            if firstInfIndex == -1 { firstInfIndex = i }
+                            infCount += 1
+                        }
+                    }
+                } else {
+                    let bufferPointer = pointer.assumingMemoryBound(to: Float.self)
+                    for i in 0..<checkableElementCount {
+                        let value = bufferPointer[i]
+                        if value.isNaN {
+                            if firstNanIndex == -1 { firstNanIndex = i }
+                            nanCount += 1
+                        }
+                        if value.isInfinite {
+                            if firstInfIndex == -1 { firstInfIndex = i }
+                            infCount += 1
+                        }
+                    }
+                }
+
+                if nanCount > 0 || infCount > 0 {
+                    print(
+                        "!!! Validation FAILED: Found \(nanCount) NaNs (first @ \(firstNanIndex)), \(infCount) Infs (first @ \(firstInfIndex)) in \(tensorName) !!!"
+                    )
+                    throw ModelLoaderError.dequantizationFailed(tensorName, nil)
+                } else {
+                    print(
+                        "--- Validation PASSED (full: checked \(checkableElementCount) elements) ---"
+                    )
+                }
             }
         }
 
@@ -387,7 +423,9 @@ class ModelLoader {
         default: expectedSize = -1
         }
         if expectedSize > 0 && finalBuffer.length < expectedSize {
-            print("Error: Processed buffer for '\(tensorName)' (\(outputType)) has incorrect size. Expected >= \(expectedSize), Got \(finalBuffer.length).")
+            print(
+                "Error: Processed buffer for '\(tensorName)' (\(outputType)) has incorrect size. Expected >= \(expectedSize), Got \(finalBuffer.length)."
+            )
             throw ModelLoaderError.dequantizationFailed(tensorName, nil)
         }
 
